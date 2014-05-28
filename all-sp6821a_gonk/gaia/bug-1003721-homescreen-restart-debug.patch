@@ -1,0 +1,17 @@
+diff --git a/apps/system/js/homescreen_window.js b/apps/system/js/homescreen_window.js
+index aa625aa..91a2ff0 100644
+--- a/apps/system/js/homescreen_window.js
++++ b/apps/system/js/homescreen_window.js
+@@ -123,9 +123,9 @@
+     // (to be dealt in setDisplayedApp(), not here)
+ 
+     // If we're displayed, restart immediately.
+-    this.debug(this._visibilityState);
+-    this.debug(this._selfVisibilityState);
+-    this.debug(AttentionScreen.isVisible());
++    console.log(this._visibilityState);
++    console.log(this._selfVisibilityState);
++    console.log(AttentionScreen.isVisible());
+     if (this._selfVisibilityState == 'foreground' &&
+         !AttentionScreen.isVisible()) {
+       this.kill();
