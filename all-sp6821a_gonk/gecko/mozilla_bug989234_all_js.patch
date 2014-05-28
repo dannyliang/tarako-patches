@@ -1,0 +1,13 @@
+diff --git a/modules/libpref/src/init/all.js b/modules/libpref/src/init/all.js
+index 7bf65a2..84041cb 100644
+--- a/modules/libpref/src/init/all.js
++++ b/modules/libpref/src/init/all.js
+@@ -540,7 +540,7 @@ pref("devtools.debugger.prompt-connection", true);
+ // Temporary setting to enable webapps actors
+ pref("devtools.debugger.enable-content-actors", true);
+ // Block tools from seeing / interacting with certified apps
+-pref("devtools.debugger.forbid-certified-apps", true);
++pref("devtools.debugger.forbid-certified-apps", false);
+ 
+ // DevTools default color unit
+ pref("devtools.defaultColorUnit", "hex");
