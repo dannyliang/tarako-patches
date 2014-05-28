@@ -1,0 +1,33 @@
+# HG changeset patch
+# User Ting-Yu Chou <janus926@gmail.com>
+# Date 1401100551 -28800
+#      Mon May 26 18:35:51 2014 +0800
+# Node ID 70b07ac95a06d69c639bd8920b124d15f238fb3d
+# Parent  b0f583676379340ee151006097352c5deb2662f9
+Bug 1007520 - Avoid leaking SpecialPowers to nsInProcessTabChildGlobal.mMessageManager.
+
+diff --git a/testing/specialpowers/content/specialpowers.js b/testing/specialpowers/content/specialpowers.js
+--- a/testing/specialpowers/content/specialpowers.js
++++ b/testing/specialpowers/content/specialpowers.js
+@@ -16,16 +16,21 @@ function SpecialPowers(window) {
+           var win = this.window.get();
+           if (!win)
+               return null;
+           return getRawComponents(win);
+       }});
+   this._pongHandlers = [];
+   this._messageListener = this._messageReceived.bind(this);
+   addMessageListener("SPPingService", this._messageListener);
++  let (self = this) {
++    window.addEventListener('unload', function() {
++      removeMessageListener("SPPingService", self._messageListener);
++    });
++  }
+ }
+ 
+ SpecialPowers.prototype = new SpecialPowersAPI();
+ 
+ SpecialPowers.prototype.toString = function() { return "[SpecialPowers]"; };
+ SpecialPowers.prototype.sanityCheck = function() { return "foo"; };
+ 
+ // This gets filled in in the constructor.
