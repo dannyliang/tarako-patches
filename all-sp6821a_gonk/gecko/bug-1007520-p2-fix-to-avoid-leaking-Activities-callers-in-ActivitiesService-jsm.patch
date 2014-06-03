@@ -1,10 +1,10 @@
 # HG changeset patch
 # User Ting-Yu Chou <janus926@gmail.com>
-# Date 1400735243 -28800
-#      Thu May 22 13:07:23 2014 +0800
-# Node ID 41ef19c25e947adbcb74b7d4f4a862d6da0ac688
+# Date 1401355018 -28800
+#      Thu May 29 17:16:58 2014 +0800
+# Node ID c0886fd9f752968a4f82a23387c40d278ad30ece
 # Parent  1ea43b2461b3355f500d8dfe6159769c62b76371
-Bug 1007520 - Fix to avoid leaking Activities.callers in ActivitiesService.jsm.
+Bug 1007520 - Part 2: Avoid leaking Activities.callers in ActivitiesService.jsm. r=fabrice
 
 diff --git a/dom/activities/src/ActivitiesService.jsm b/dom/activities/src/ActivitiesService.jsm
 --- a/dom/activities/src/ActivitiesService.jsm
@@ -25,7 +25,7 @@ diff --git a/dom/activities/src/ActivitiesService.jsm b/dom/activities/src/Activ
        // We have no matching activity registered, let's fire an error.
        if (aResults.options.length === 0) {
 -        Activities.callers[aMsg.id].mm.sendAsyncMessage("Activity:FireError", {
-+        self.maybeSendMessage(aMsg.id, "Activity:FireError", {
++        self.trySendAndCleanup(aMsg.id, "Activity:FireError", {
            "id": aMsg.id,
            "error": "NO_PROVIDER"
          });
@@ -39,7 +39,7 @@ diff --git a/dom/activities/src/ActivitiesService.jsm b/dom/activities/src/Activ
          // The user has cancelled the choice, fire an error.
          if (aChoice === -1) {
 -          Activities.callers[aMsg.id].mm.sendAsyncMessage("Activity:FireError", {
-+          self.maybeSendMessage(aMsg.id, "Activity:FireError", {
++          self.trySendAndCleanup(aMsg.id, "Activity:FireError", {
              "id": aMsg.id,
              "error": "ActivityCanceled"
            });
@@ -76,7 +76,7 @@ diff --git a/dom/activities/src/ActivitiesService.jsm b/dom/activities/src/Activ
 -          Activities.callers[aMsg.id].mm.sendAsyncMessage("Activity:FireSuccess", {
 +          // No need to notify observers, since we don't want the caller
 +          // to be raised on the foreground that quick.
-+          self.maybeSendMessage(aMsg.id, "Activity:FireSuccess", {
++          self.trySendAndCleanup(aMsg.id, "Activity:FireSuccess", {
              "id": aMsg.id,
              "result": null
            });
@@ -100,7 +100,7 @@ diff --git a/dom/activities/src/ActivitiesService.jsm b/dom/activities/src/Activ
      this.db.find(aMsg, successCb, errorCb, matchFunc);
    },
  
-+  maybeSendMessage: function activities_maybeSendMessage(aId, aName, aPayload) {
++  trySendAndCleanup: function activities_trySendAndCleanup(aId, aName, aPayload) {
 +    try {
 +      this.callers[aId].mm.sendAsyncMessage(aName, aPayload);
 +    } finally {
@@ -127,12 +127,12 @@ diff --git a/dom/activities/src/ActivitiesService.jsm b/dom/activities/src/Activ
        case "Activity:PostResult":
 -        caller.mm.sendAsyncMessage("Activity:FireSuccess", msg);
 -        delete this.callers[msg.id];
-+        this.maybeSendMessage(msg.id, "Activity:FireSuccess", msg);
++        this.trySendAndCleanup(msg.id, "Activity:FireSuccess", msg);
          break;
        case "Activity:PostError":
 -        caller.mm.sendAsyncMessage("Activity:FireError", msg);
 -        delete this.callers[msg.id];
-+        this.maybeSendMessage(msg.id, "Activity:FireError", msg);
++        this.trySendAndCleanup(msg.id, "Activity:FireError", msg);
          break;
  
        case "Activities:Register":
@@ -151,7 +151,7 @@ diff --git a/dom/activities/src/ActivitiesService.jsm b/dom/activities/src/Activ
          for (let id in this.callers) {
            if (this.callers[id].childMM == mm) {
 -            this.callers[id].mm.sendAsyncMessage("Activity:FireError", {
-+            this.maybeSendMessage(id, "Activity:FireError", {
++            this.trySendAndCleanup(id, "Activity:FireError", {
                "id": id,
                "error": "ActivityCanceled"
              });
