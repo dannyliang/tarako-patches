@@ -1,0 +1,862 @@
+diff --git a/b2g/app/B2GLoader.cpp b/b2g/app/B2GLoader.cpp
+index ac09401..5751ed1 100644
+--- a/b2g/app/B2GLoader.cpp
++++ b/b2g/app/B2GLoader.cpp
+@@ -22,20 +22,22 @@
+ #include <dlfcn.h>
+ 
+ #include "nsXPCOMPrivate.h" // for MAXPATHLEN and XPCOM_DLL
+ 
+ 
+ // Functions being loaded by XPCOMGlue
+ XRE_ProcLoaderServiceRunType XRE_ProcLoaderServiceRun;
+ XRE_ProcLoaderClientInitType XRE_ProcLoaderClientInit;
++XRE_ProcLoaderPreloadType XRE_ProcLoaderPreload;
+ 
+ static const nsDynamicFunctionLoad kXULFuncs[] = {
+   { "XRE_ProcLoaderServiceRun", (NSFuncPtr*) &XRE_ProcLoaderServiceRun },
+   { "XRE_ProcLoaderClientInit", (NSFuncPtr*) &XRE_ProcLoaderClientInit },
++  { "XRE_ProcLoaderPreload", (NSFuncPtr*) &XRE_ProcLoaderPreload },
+   { nullptr, nullptr }
+ };
+ 
+ static bool
+ getDirnameSlash(const char *aPath, char *aOutDir, int aMaxLen)
+ {
+   char *lastSlash = strrchr(aPath, XPCOM_FILE_PATH_SEPARATOR[0]);
+   int cpsz = lastSlash - aPath + 1; // include slash
+@@ -91,17 +93,27 @@ loadLibxul(const char *aXPCOMPath)
+ static bool
+ loadStaticData(const char *aProgram)
+ {
+   char xpcomPath[MAXPATHLEN];
+   bool err = getXPCOMPath(aProgram, xpcomPath, MAXPATHLEN);
+   if (err) return true;
+ 
+   err = loadLibxul(xpcomPath);
+-  return err;
++  if (err) return true;
++
++  char progDir[MAXPATHLEN];
++  err = getDirnameSlash(xpcomPath, progDir, MAXPATHLEN);
++  if (err) {
++    return true;
++  }
++
++  XRE_ProcLoaderPreload(progDir);
++
++  return false;
+ }
+ 
+ /**
+  * Fork and run parent and child process.
+  *
+  * The parent is the b2g process and child for Nuwa.
+  */
+ static int
+diff --git a/toolkit/xre/moz.build b/toolkit/xre/moz.build
+index ad7901f..b851d5e 100644
+--- a/toolkit/xre/moz.build
++++ b/toolkit/xre/moz.build
+@@ -139,8 +139,11 @@ if CONFIG['OS_ARCH'] == 'Linux' and 'lib64' in CONFIG['libdir']:
+ 
+ DEFINES['GRE_MILESTONE'] = CONFIG['GRE_MILESTONE']
+ 
+ for var in ('APP_VERSION', 'APP_ID'):
+     DEFINES[var] = CONFIG['MOZ_%s' % var]
+ 
+ if CONFIG['MOZILLA_OFFICIAL']:
+     DEFINES['MOZILLA_OFFICIAL'] = True
++
++if CONFIG['MOZ_B2G_LOADER']:
++    DEFINES['OMNIJAR_NAME'] = CONFIG['OMNIJAR_NAME']
+diff --git a/toolkit/xre/nsEmbedFunctions.cpp b/toolkit/xre/nsEmbedFunctions.cpp
+index 019ecde..5fa0681 100644
+--- a/toolkit/xre/nsEmbedFunctions.cpp
++++ b/toolkit/xre/nsEmbedFunctions.cpp
+@@ -72,16 +72,20 @@
+ 
+ #ifdef MOZ_IPDL_TESTS
+ #include "mozilla/_ipdltest/IPDLUnitTests.h"
+ #include "mozilla/_ipdltest/IPDLUnitTestProcessChild.h"
+ 
+ using mozilla::_ipdltest::IPDLUnitTestProcessChild;
+ #endif  // ifdef MOZ_IPDL_TESTS
+ 
++#ifdef MOZ_B2G_LOADER
++#include "nsLocalFile.h"
++#endif
++
+ using namespace mozilla;
+ 
+ using mozilla::ipc::BrowserProcessSubThread;
+ using mozilla::ipc::GeckoChildProcessHost;
+ using mozilla::ipc::IOThreadChild;
+ using mozilla::ipc::ProcessChild;
+ using mozilla::ipc::ScopedXREEmbed;
+ 
+@@ -792,8 +796,33 @@ SetWindowsEnvironment(WindowsEnvironmentType aEnvID)
+ 
+ WindowsEnvironmentType
+ XRE_GetWindowsEnvironment()
+ {
+   return sWindowsEnvironmentType;
+ }
+ #endif // XP_WIN
+ 
++#ifdef MOZ_B2G_LOADER
++/**
++ * Preload static data of Gecko for B2G loader.
++ *
++ * This function is supposed to be called before XPCOM is initialized.
++ * For now, this function preloads
++ *  - XPT interface Information
++ */
++void
++XRE_ProcLoaderPreload(const char *aProgramDir)
++{
++    void PreloadXPT(nsIFile *);
++
++    nsresult rv;
++    nsCOMPtr<nsIFile> omnijarFile;
++    rv = NS_NewNativeLocalFile(nsCString(aProgramDir),
++			       true,
++			       getter_AddRefs(omnijarFile));
++    MOZ_ASSERT(NS_SUCCEEDED(rv));
++    rv = omnijarFile->AppendNative(NS_LITERAL_CSTRING(NS_STRINGIFY(OMNIJAR_NAME)));
++    MOZ_ASSERT(NS_SUCCEEDED(rv));
++
++    PreloadXPT(omnijarFile);
++}
++#endif /* MOZ_B2G_LOADER */
+diff --git a/xpcom/build/nsXULAppAPI.h b/xpcom/build/nsXULAppAPI.h
+index 44edc45..60ad803 100644
+--- a/xpcom/build/nsXULAppAPI.h
++++ b/xpcom/build/nsXULAppAPI.h
+@@ -466,14 +466,16 @@ XRE_API(WindowsEnvironmentType,
+         XRE_GetWindowsEnvironment, ())
+ #endif // XP_WIN
+ 
+ #ifdef MOZ_B2G_LOADER
+ XRE_API(int,
+         XRE_ProcLoaderServiceRun, (pid_t, int, int argc, const char *argv[]));
+ XRE_API(void,
+         XRE_ProcLoaderClientInit, (pid_t, int));
++XRE_API(void,
++        XRE_ProcLoaderPreload, (const char *));
+ #endif // MOZ_B2G_LOADER
+ 
+ XRE_API(int,
+         XRE_XPCShellMain, (int argc, char** argv, char** envp))
+ 
+ #endif // _nsXULAppAPI_h__
+diff --git a/xpcom/components/ManifestParser.cpp b/xpcom/components/ManifestParser.cpp
+index 95a9653..bcb1ae4 100644
+--- a/xpcom/components/ManifestParser.cpp
++++ b/xpcom/components/ManifestParser.cpp
+@@ -30,16 +30,28 @@
+ #include "nsTextFormatter.h"
+ #include "nsVersionComparator.h"
+ #include "nsXPCOMCIDInternal.h"
+ 
+ #include "nsIConsoleService.h"
+ #include "nsIScriptError.h"
+ #include "nsIXULAppInfo.h"
+ #include "nsIXULRuntime.h"
++#ifdef MOZ_B2G_LOADER
++#include "mozilla/XPTInterfaceInfoManager.h"
++#endif
++
++#ifdef MOZ_B2G_LOADER
++#define XPTONLY_MANIFEST &nsComponentManagerImpl::XPTOnlyManifestManifest
++#define XPTONLY_XPT &nsComponentManagerImpl::XPTOnlyManifestXPT
++#else
++#define XPTONLY_MANIFEST nullptr
++#define XPTONLY_XPT nullptr
++#endif
++
+ 
+ using namespace mozilla;
+ 
+ struct ManifestDirective
+ {
+   const char* directive;
+   int argc;
+ 
+@@ -58,46 +70,53 @@ struct ManifestDirective
+   // hasn't learned how to initialize unions in a sane way.
+   void (nsComponentManagerImpl::*mgrfunc)
+     (nsComponentManagerImpl::ManifestProcessingContext& cx,
+      int lineno, char *const * argv);
+   void (nsChromeRegistry::*regfunc)
+     (nsChromeRegistry::ManifestProcessingContext& cx,
+      int lineno, char *const *argv,
+      bool platform, bool contentaccessible);
++#ifdef MOZ_B2G_LOADER
++  // The function to handle the directive for XPT Only parsing.
++  void (*xptonlyfunc)(nsComponentManagerImpl::XPTOnlyManifestProcessingContext& cx,
++                      int lineno, char *const * argv);
++#else
++  void *xptonlyfunc;
++#endif
+ 
+   bool isContract;
+ };
+ static const ManifestDirective kParsingTable[] = {
+   { "manifest",         1, false, true, true, false,
+-    &nsComponentManagerImpl::ManifestManifest, nullptr },
++    &nsComponentManagerImpl::ManifestManifest, nullptr, XPTONLY_MANIFEST },
+   { "binary-component", 1, true, false, false, false,
+-    &nsComponentManagerImpl::ManifestBinaryComponent, nullptr },
++    &nsComponentManagerImpl::ManifestBinaryComponent, nullptr, nullptr },
+   { "interfaces",       1, true, false, false, false,
+-    &nsComponentManagerImpl::ManifestXPT, nullptr },
++    &nsComponentManagerImpl::ManifestXPT, nullptr, XPTONLY_XPT },
+   { "component",        2, true, false, false, false,
+-    &nsComponentManagerImpl::ManifestComponent, nullptr },
++    &nsComponentManagerImpl::ManifestComponent, nullptr, nullptr },
+   { "contract",         2, true, false, false, false,
+-    &nsComponentManagerImpl::ManifestContract, nullptr, true},
++    &nsComponentManagerImpl::ManifestContract, nullptr, nullptr, true},
+   { "category",         3, true, false, false, false,
+-    &nsComponentManagerImpl::ManifestCategory, nullptr },
++    &nsComponentManagerImpl::ManifestCategory, nullptr, nullptr },
+   { "content",          2, true, true, true,  true,
+-    nullptr, &nsChromeRegistry::ManifestContent },
++    nullptr, &nsChromeRegistry::ManifestContent, nullptr },
+   { "locale",           3, true, true, true,  false,
+-    nullptr, &nsChromeRegistry::ManifestLocale },
++    nullptr, &nsChromeRegistry::ManifestLocale, nullptr },
+   { "skin",             3, false, true, true,  false,
+-    nullptr, &nsChromeRegistry::ManifestSkin },
++    nullptr, &nsChromeRegistry::ManifestSkin, nullptr },
+   { "overlay",          2, true, true, false,  false,
+-    nullptr, &nsChromeRegistry::ManifestOverlay },
++    nullptr, &nsChromeRegistry::ManifestOverlay, nullptr },
+   { "style",            2, false, true, false,  false,
+-    nullptr, &nsChromeRegistry::ManifestStyle },
++    nullptr, &nsChromeRegistry::ManifestStyle, nullptr },
+   { "override",         2, true, true, true,  false,
+-    nullptr, &nsChromeRegistry::ManifestOverride },
++    nullptr, &nsChromeRegistry::ManifestOverride, nullptr },
+   { "resource",         2, true, true, false,  false,
+-    nullptr, &nsChromeRegistry::ManifestResource }
++    nullptr, &nsChromeRegistry::ManifestResource, nullptr }
+ };
+ 
+ static const char kWhitespace[] = "\t ";
+ 
+ static bool IsNewline(char c)
+ {
+   return c == '\n' || c == '\r';
+ }
+@@ -120,43 +139,59 @@ struct AutoPR_smprintf_free
+     return mBuf;
+   }
+ 
+   char* mBuf;
+ };
+ 
+ } // anonymous namespace
+ 
++/**
++ * If we are pre-loading XPTs, this method may do nothing because the
++ * console service is not initialized.
++ */
+ void LogMessage(const char* aMsg, ...)
+ {
++  if (!nsComponentManagerImpl::gComponentManager) {
++    return;
++  }
++
+   nsCOMPtr<nsIConsoleService> console =
+     do_GetService(NS_CONSOLESERVICE_CONTRACTID);
+   if (!console)
+     return;
+ 
+   va_list args;
+   va_start(args, aMsg);
+   AutoPR_smprintf_free formatted(PR_vsmprintf(aMsg, args));
+   va_end(args);
+ 
+   nsCOMPtr<nsIConsoleMessage> error =
+     new nsConsoleMessage(NS_ConvertUTF8toUTF16(formatted).get());
+   console->LogMessage(error);
+ }
+ 
++/**
++ * If we are pre-loading XPTs, this method may do nothing because the
++ * console service is not initialized.
++ */
+ void LogMessageWithContext(FileLocation &aFile,
+                            uint32_t aLineNumber, const char* aMsg, ...)
+ {
+   va_list args;
+   va_start(args, aMsg);
+   AutoPR_smprintf_free formatted(PR_vsmprintf(aMsg, args));
+   va_end(args);
+   if (!formatted)
+     return;
+ 
++  if (!nsComponentManagerImpl::gComponentManager) {
++    return;
++  }
++
+   nsCString file;
+   aFile.GetURIString(file);
+ 
+   nsCOMPtr<nsIScriptError> error =
+     do_CreateInstance(NS_SCRIPTERROR_CONTRACTID);
+   if (!error) {
+     // This can happen early in component registration. Fall back to a
+     // generic console message.
+@@ -382,21 +417,33 @@ struct CachedDirective
+ {
+   int lineno;
+   char* argv[4];
+ };
+ 
+ } // anonymous namespace
+ 
+ 
++/**
++ * For XPT-Only mode, the parser handles only directives of "manifest"
++ * and "interfaces", and always call the function given by |xptonlyfunc|
++ * variable of struct |ManifestDirective|.
++ *
++ * This function is safe to be called before the component manager is
++ * ready if aXPTOnly is true for it don't invoke any component during
++ * parsing.
++ */
+ void
+-ParseManifest(NSLocationType type, FileLocation &file, char* buf, bool aChromeOnly)
++ParseManifest(NSLocationType type, FileLocation &file, char* buf, bool aChromeOnly, bool aXPTOnly)
+ {
+   nsComponentManagerImpl::ManifestProcessingContext mgrcx(type, file, aChromeOnly);
+   nsChromeRegistry::ManifestProcessingContext chromecx(type, file);
++#ifdef MOZ_B2G_LOADER
++  nsComponentManagerImpl::XPTOnlyManifestProcessingContext xptonlycx(file);
++#endif
+   nsresult rv;
+ 
+   NS_NAMED_LITERAL_STRING(kPlatform, "platform");
+   NS_NAMED_LITERAL_STRING(kContentAccessible, "contentaccessible");
+   NS_NAMED_LITERAL_STRING(kApplication, "application");
+   NS_NAMED_LITERAL_STRING(kAppVersion, "appversion");
+   NS_NAMED_LITERAL_STRING(kGeckoVersion, "platformversion");
+   NS_NAMED_LITERAL_STRING(kOs, "os");
+@@ -410,17 +457,22 @@ ParseManifest(NSLocationType type, FileLocation &file, char* buf, bool aChromeOn
+   NS_NAMED_LITERAL_STRING(kXPCNativeWrappers, "xpcnativewrappers");
+ 
+   nsAutoString appID;
+   nsAutoString appVersion;
+   nsAutoString geckoVersion;
+   nsAutoString osTarget;
+   nsAutoString abi;
+ 
+-  nsCOMPtr<nsIXULAppInfo> xapp (do_GetService(XULAPPINFO_SERVICE_CONTRACTID));
++  nsCOMPtr<nsIXULAppInfo> xapp;
++  if (!aXPTOnly) {
++    // Avoid to create any component for XPT only mode.
++    // No xapp means no ID, version, ..., modifiers checking.
++    xapp = do_GetService(XULAPPINFO_SERVICE_CONTRACTID);
++  }
+   if (xapp) {
+     nsAutoCString s;
+     rv = xapp->GetID(s);
+     if (NS_SUCCEEDED(rv))
+       CopyUTF8toUTF16(s, appID);
+ 
+     rv = xapp->GetVersion(s);
+     if (NS_SUCCEEDED(rv))
+@@ -509,19 +561,20 @@ ParseManifest(NSLocationType type, FileLocation &file, char* buf, bool aChromeOn
+     char *whitespace = token;
+     token = nsCRT::strtok(whitespace, kWhitespace, &whitespace);
+     if (!token) continue;
+ 
+     const ManifestDirective* directive = nullptr;
+     for (const ManifestDirective* d = kParsingTable;
+ 	 d < ArrayEnd(kParsingTable);
+ 	 ++d) {
+-      if (!strcmp(d->directive, token)) {
+-	directive = d;
+-	break;
++      if (!strcmp(d->directive, token) &&
++          (!aXPTOnly || d->xptonlyfunc)) {
++        directive = d;
++        break;
+       }
+     }
+ 
+     if (!directive) {
+       LogMessageWithContext(file, line,
+                             "Ignoring unrecognized chrome manifest directive '%s'.",
+                             token);
+       continue;
+@@ -560,28 +613,35 @@ ParseManifest(NSLocationType type, FileLocation &file, char* buf, bool aChromeOn
+     TriState stOsVersion = eUnspecified;
+     TriState stOs = eUnspecified;
+     TriState stABI = eUnspecified;
+ #if defined(MOZ_WIDGET_ANDROID)
+     TriState stTablet = eUnspecified;
+ #endif
+     bool platform = false;
+     bool contentAccessible = false;
++#ifdef MOZ_B2G_LOADER
++    bool hasFlags = false;
++#endif
+ 
+     while (nullptr != (token = nsCRT::strtok(whitespace, kWhitespace, &whitespace)) && ok) {
+       ToLowerCase(token);
+       NS_ConvertASCIItoUTF16 wtoken(token);
+ 
+       if (CheckStringFlag(kApplication, wtoken, appID, stApp) ||
+           CheckStringFlag(kOs, wtoken, osTarget, stOs) ||
+           CheckStringFlag(kABI, wtoken, abi, stABI) ||
+           CheckVersionFlag(kOsVersion, wtoken, osVersion, stOsVersion) ||
+           CheckVersionFlag(kAppVersion, wtoken, appVersion, stAppVersion) ||
+-          CheckVersionFlag(kGeckoVersion, wtoken, geckoVersion, stGeckoVersion))
++          CheckVersionFlag(kGeckoVersion, wtoken, geckoVersion, stGeckoVersion)) {
++#ifdef MOZ_B2G_LOADER
++        hasFlags = true;
++#endif
+         continue;
++      }
+ 
+ #if defined(MOZ_WIDGET_ANDROID)
+       bool tablet = false;
+       if (CheckFlag(kTablet, wtoken, tablet)) {
+         stTablet = (tablet == isTablet) ? eOK : eBad;
+         continue;
+       }
+ #endif
+@@ -601,27 +661,35 @@ ParseManifest(NSLocationType type, FileLocation &file, char* buf, bool aChromeOn
+ 
+       LogMessageWithContext(file, line,
+                             "Unrecognized chrome manifest modifier '%s'.",
+                             token);
+       ok = false;
+     }
+ 
+     if (!ok ||
++#ifdef MOZ_B2G_LOADER
++        hasFlags ||
++#endif
+         stApp == eBad ||
+         stAppVersion == eBad ||
+         stGeckoVersion == eBad ||
+         stOs == eBad ||
+         stOsVersion == eBad ||
+ #ifdef MOZ_WIDGET_ANDROID
+         stTablet == eBad ||
+ #endif
+         stABI == eBad)
+       continue;
+ 
++#ifdef MOZ_B2G_LOADER
++    if (aXPTOnly) {
++      directive->xptonlyfunc(xptonlycx, line, argv);
++    } else
++#endif /* MOZ_B2G_LOADER */
+     if (directive->regfunc) {
+       if (GeckoProcessType_Default != XRE_GetProcessType())
+         continue;
+ 
+       if (!nsChromeRegistry::gChromeRegistry) {
+         nsCOMPtr<nsIChromeRegistry> cr =
+           mozilla::services::GetChromeRegistryService();
+         if (!nsChromeRegistry::gChromeRegistry) {
+@@ -629,26 +697,29 @@ ParseManifest(NSLocationType type, FileLocation &file, char* buf, bool aChromeOn
+                                 "Chrome registry isn't available yet.");
+           continue;
+         }
+       }
+ 
+       (nsChromeRegistry::gChromeRegistry->*(directive->regfunc))
+ 	(chromecx, line, argv, platform, contentAccessible);
+     }
+-    else if (directive->ischrome || !aChromeOnly) {
++    else if (directive->mgrfunc && (directive->ischrome || !aChromeOnly)) {
+       if (directive->isContract) {
+         CachedDirective* cd = contracts.AppendElement();
+         cd->lineno = line;
+         cd->argv[0] = argv[0];
+         cd->argv[1] = argv[1];
+       }
+       else
+         (nsComponentManagerImpl::gComponentManager->*(directive->mgrfunc))
+           (mgrcx, line, argv);
++    } else {
++      LogMessageWithContext(file, line,
++                            "No valid manifest directive.");
+     }
+   }
+ 
+   for (uint32_t i = 0; i < contracts.Length(); ++i) {
+     CachedDirective& d = contracts[i];
+     nsComponentManagerImpl::gComponentManager->ManifestContract
+       (mgrcx, d.lineno, d.argv);
+   }
+diff --git a/xpcom/components/ManifestParser.h b/xpcom/components/ManifestParser.h
+index 2260196..4229980 100644
+--- a/xpcom/components/ManifestParser.h
++++ b/xpcom/components/ManifestParser.h
+@@ -8,16 +8,16 @@
+ 
+ #include "nsComponentManager.h"
+ #include "nsChromeRegistry.h"
+ #include "mozilla/FileLocation.h"
+ 
+ class nsIFile;
+ 
+ void ParseManifest(NSLocationType type, mozilla::FileLocation &file,
+-                   char* buf, bool aChromeOnly);
++                   char* buf, bool aChromeOnly, bool aXPTOnly=false);
+ 
+ void LogMessage(const char* aMsg, ...);
+ 
+ void LogMessageWithContext(mozilla::FileLocation &aFile,
+                            uint32_t aLineNumber, const char* aMsg, ...);
+ 
+ #endif // ManifestParser_h
+diff --git a/xpcom/components/nsComponentManager.cpp b/xpcom/components/nsComponentManager.cpp
+index 3516ff7..42940b9 100644
+--- a/xpcom/components/nsComponentManager.cpp
++++ b/xpcom/components/nsComponentManager.cpp
+@@ -65,16 +65,17 @@
+ #include "mozilla/GenericFactory.h"
+ #include "nsSupportsPrimitives.h"
+ #include "nsArray.h"
+ #include "nsIMutableArray.h"
+ #include "nsArrayEnumerator.h"
+ #include "nsStringEnumerator.h"
+ #include "mozilla/FileUtils.h"
+ #include "nsNetUtil.h"
++#include "nsDataHashtable.h"
+ 
+ #include <new>     // for placement new
+ 
+ #include "mozilla/Omnijar.h"
+ 
+ #include "prlog.h"
+ 
+ using namespace mozilla;
+@@ -132,16 +133,46 @@ static const char gIDFormat[] =
+     {0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00} \
+ }
+ 
+ NS_DEFINE_CID(kEmptyCID, NS_EMPTY_IID);
+ NS_DEFINE_CID(kCategoryManagerCID, NS_CATEGORYMANAGER_CID);
+ 
+ #define UID_STRING_LENGTH 39
+ 
++#ifdef MOZ_B2G_LOADER
++typedef nsDataHashtable<nsCStringHashKey, bool> XPTIInfosBookType;
++static XPTIInfosBookType *sXPTIInfosBook = nullptr;
++
++static XPTIInfosBookType *
++GetXPTIInfosBook()
++{
++    if (sXPTIInfosBook == nullptr) {
++        sXPTIInfosBook = new XPTIInfosBookType;
++    }
++    return sXPTIInfosBook;
++}
++
++static bool
++IsRegisteredXPTIInfo(FileLocation &aFile)
++{
++    nsAutoCString uri;
++    aFile.GetURIString(uri);
++    return GetXPTIInfosBook()->Get(uri);
++}
++
++static void
++MarkRegisteredXPTIInfo(FileLocation &aFile)
++{
++    nsAutoCString uri;
++    aFile.GetURIString(uri);
++    GetXPTIInfosBook()->Put(uri, true);
++}
++#endif /* MOZ_B2G_LOADER */
++
+ nsresult
+ nsGetServiceFromCategory::operator()(const nsIID& aIID, void** aInstancePtr) const
+ {
+     nsresult rv;
+     nsXPIDLCString value;
+     nsCOMPtr<nsICategoryManager> catman;
+     nsComponentManagerImpl *compMgr = nsComponentManagerImpl::gComponentManager;
+     if (!compMgr) {
+@@ -519,43 +550,54 @@ CutExtension(nsCString& path)
+ {
+     int32_t dotPos = path.RFindChar('.');
+     if (kNotFound == dotPos)
+         path.Truncate();
+     else
+         path.Cut(0, dotPos + 1);
+ }
+ 
+-void
+-nsComponentManagerImpl::RegisterManifest(NSLocationType aType,
+-                                         FileLocation &aFile,
+-                                         bool aChromeOnly)
++static void
++DoRegisterManifest(NSLocationType aType,
++                   FileLocation &aFile,
++                   bool aChromeOnly,
++                   bool aXPTOnly)
+ {
++    MOZ_ASSERT(!aXPTOnly ||
++               nsComponentManagerImpl::gComponentManager == nullptr);
+     uint32_t len;
+     FileLocation::Data data;
+     nsAutoArrayPtr<char> buf;
+     nsresult rv = aFile.GetData(data);
+     if (NS_SUCCEEDED(rv)) {
+         rv = data.GetSize(&len);
+     }
+     if (NS_SUCCEEDED(rv)) {
+         buf = new char[len + 1];
+         rv = data.Copy(buf, len);
+     }
+     if (NS_SUCCEEDED(rv)) {
+         buf[len] = '\0';
+-        ParseManifest(aType, aFile, buf, aChromeOnly);
++        ParseManifest(aType, aFile, buf, aChromeOnly, aXPTOnly);
+     } else if (NS_BOOTSTRAPPED_LOCATION != aType) {
+         nsCString uri;
+         aFile.GetURIString(uri);
+         LogMessage("Could not read chrome manifest '%s'.", uri.get());
+     }
+ }
+ 
+ void
++nsComponentManagerImpl::RegisterManifest(NSLocationType aType,
++                                         FileLocation &aFile,
++                                         bool aChromeOnly)
++{
++    DoRegisterManifest(aType, aFile, aChromeOnly, false);
++}
++
++void
+ nsComponentManagerImpl::ManifestManifest(ManifestProcessingContext& cx, int lineno, char *const * argv)
+ {
+     char* file = argv[0];
+     FileLocation f(cx.mFile, file);
+     RegisterManifest(cx.mType, f, cx.mChromeOnly);
+ }
+ 
+ void
+@@ -582,41 +624,56 @@ nsComponentManagerImpl::ManifestBinaryComponent(ManifestProcessingContext& cx, i
+     const mozilla::Module* m = mNativeModuleLoader.LoadModule(f);
+     // The native module loader should report an error here, we don't have to
+     if (!m)
+         return;
+ 
+     RegisterModule(m, &f);
+ }
+ 
+-void
+-nsComponentManagerImpl::ManifestXPT(ManifestProcessingContext& cx, int lineno, char *const * argv)
++static void
++DoRegisterXPT(FileLocation &aFile)
+ {
+-    FileLocation f(cx.mFile, argv[0]);
++#ifdef MOZ_B2G_LOADER
++    if (IsRegisteredXPTIInfo(aFile)) {
++        return;
++    }
++#endif
++
+     uint32_t len;
+     FileLocation::Data data;
+     nsAutoArrayPtr<char> buf;
+-    nsresult rv = f.GetData(data);
++    nsresult rv = aFile.GetData(data);
+     if (NS_SUCCEEDED(rv)) {
+         rv = data.GetSize(&len);
+     }
+     if (NS_SUCCEEDED(rv)) {
+         buf = new char[len];
+         rv = data.Copy(buf, len);
+     }
+     if (NS_SUCCEEDED(rv)) {
+         XPTInterfaceInfoManager::GetSingleton()->RegisterBuffer(buf, len);
++#ifdef MOZ_B2G_LOADER
++        MarkRegisteredXPTIInfo(aFile);
++#endif
+     } else {
+         nsCString uri;
+-        f.GetURIString(uri);
++        aFile.GetURIString(uri);
+         LogMessage("Could not read '%s'.", uri.get());
+     }
+ }
+ 
+ void
++nsComponentManagerImpl::ManifestXPT(ManifestProcessingContext& cx, int lineno, char *const * argv)
++{
++    FileLocation f(cx.mFile, argv[0]);
++    DoRegisterXPT(f);
++}
++
++void
+ nsComponentManagerImpl::ManifestComponent(ManifestProcessingContext& cx, int lineno, char *const * argv)
+ {
+     mLock.AssertNotCurrentThreadOwns();
+ 
+     char* id = argv[0];
+     char* file = argv[1];
+ 
+     nsID cid;
+@@ -789,16 +846,18 @@ nsresult nsComponentManagerImpl::Shutdown(void)
+     mContractIDs.Clear();
+     mFactories.Clear(); // XXX release the objects, don't just clear
+     mLoaderMap.Clear();
+     mKnownModules.Clear();
+     mKnownStaticModules.Clear();
+ 
+     delete sStaticModules;
+     delete sModuleLocations;
++    delete sXPTIInfosBook;
++    sXPTIInfosBook = nullptr;
+ 
+     // Unload libraries
+     mNativeModuleLoader.UnloadLibraries();
+ 
+     // delete arena for strings and small objects
+     PL_FinishArenaPool(&mArena);
+ 
+     mStatus = SHUTDOWN_COMPLETE;
+@@ -1931,16 +1990,64 @@ nsComponentManagerImpl::GetManifestLocations(nsIArray **aLocations)
+     if (NS_SUCCEEDED(rv))
+       locations->AppendElement(uri, false);
+   }
+ 
+   locations.forget(aLocations);
+   return NS_OK;
+ }
+ 
++#ifdef MOZ_B2G_LOADER
++
++/* static */
++void
++nsComponentManagerImpl::XPTOnlyManifestManifest(XPTOnlyManifestProcessingContext &aCx,
++                                                int aLineno,
++                                                char * const * aArgv)
++{
++    char* file = aArgv[0];
++    FileLocation f(aCx.mFile, file);
++
++    DoRegisterManifest(NS_COMPONENT_LOCATION, f, false, true);
++}
++
++/* static */
++void
++nsComponentManagerImpl::XPTOnlyManifestXPT(XPTOnlyManifestProcessingContext &aCx,
++                                           int aLineno,
++                                           char * const * aArgv)
++{
++    FileLocation f(aCx.mFile, aArgv[0]);
++    DoRegisterXPT(f);
++}
++
++/**
++ * To load XPT Interface Information before the component manager is ready.
++ *
++ * With this function, B2G loader could XPT interface info. as earier
++ * as possible to gain benefit of shared memory model of the kernel.
++ */
++/* static */ void
++nsComponentManagerImpl::PreloadXPT(nsIFile *aFile)
++{
++    MOZ_ASSERT(nsComponentManagerImpl::gComponentManager == nullptr);
++    FileLocation location(aFile, "chrome.manifest");
++
++    DoRegisterManifest(NS_COMPONENT_LOCATION, location,
++                       false, true /* aXPTOnly */);
++}
++
++void
++PreloadXPT(nsIFile *aOmnijarFile)
++{
++    nsComponentManagerImpl::PreloadXPT(aOmnijarFile);
++}
++
++#endif /* MOZ_B2G_LOADER */
++
+ EXPORT_XPCOM_API(nsresult)
+ XRE_AddManifestLocation(NSLocationType aType, nsIFile* aLocation)
+ {
+     nsComponentManagerImpl::InitializeModuleLocations();
+     nsComponentManagerImpl::ComponentLocation* c = 
+         nsComponentManagerImpl::sModuleLocations->AppendElement();
+     c->type = aType;
+     c->location.Init(aLocation);
+diff --git a/xpcom/components/nsComponentManager.h b/xpcom/components/nsComponentManager.h
+index 1052de0..88cc199 100644
+--- a/xpcom/components/nsComponentManager.h
++++ b/xpcom/components/nsComponentManager.h
+@@ -33,16 +33,20 @@
+ #include "nsDataHashtable.h"
+ #include "nsInterfaceHashtable.h"
+ #include "nsClassHashtable.h"
+ #include "nsTArray.h"
+ 
+ #include "mozilla/Omnijar.h"
+ #include "mozilla/Attributes.h"
+ 
++#ifdef MOZ_B2G_LOADER
++#include "mozilla/FileLocation.h"
++#endif
++
+ struct nsFactoryEntry;
+ class nsIServiceManager;
+ struct PRThread;
+ 
+ #define NS_COMPONENTMANAGER_CID                      \
+ { /* 91775d60-d5dc-11d2-92fb-00e09805570f */         \
+     0x91775d60,                                      \
+     0xd5dc,                                          \
+@@ -311,16 +315,40 @@ public:
+     inline void RemovePendingService(const nsCID& aServiceCID);
+     inline PRThread* GetPendingServiceThread(const nsCID& aServiceCID) const;
+ 
+     nsTArray<PendingServiceInfo> mPendingServices;
+ 
+     int64_t Amount() MOZ_OVERRIDE;
+     size_t SizeOfIncludingThis(mozilla::MallocSizeOf aMallocSizeOf);
+ 
++#ifdef MOZ_B2G_LOADER
++    // Preload XPT interface info for B2G loader.
++    // This function is called before XPCOM has been initialized.
++    static void PreloadXPT(nsIFile *aFile);
++#endif
++
++#ifdef MOZ_B2G_LOADER
++    // Parsing functions of directives of manifest for XPT only parsing.
++    struct XPTOnlyManifestProcessingContext
++    {
++        XPTOnlyManifestProcessingContext(mozilla::FileLocation &aFile)
++            : mFile(aFile)
++        { }
++
++        ~XPTOnlyManifestProcessingContext() { }
++
++        mozilla::FileLocation mFile;
++    };
++    static void XPTOnlyManifestManifest(XPTOnlyManifestProcessingContext& aCx,
++                                        int aLineno, char * const *aArgv);
++    static void XPTOnlyManifestXPT(XPTOnlyManifestProcessingContext& aCx,
++                                   int aLineno, char * const *aArgv);
++#endif
++
+ private:
+     ~nsComponentManagerImpl();
+ };
+ 
+ 
+ #define NS_MAX_FILENAME_LEN     1024
+ 
+ #define NS_ERROR_IS_DIR NS_ERROR_GENERATE_FAILURE(NS_ERROR_MODULE_XPCOM, 24)

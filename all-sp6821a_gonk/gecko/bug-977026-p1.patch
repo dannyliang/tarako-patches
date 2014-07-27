@@ -1,0 +1,46 @@
+diff --git a/tools/profiler/platform.cpp b/tools/profiler/platform.cpp
+index 5448c5b..368f67a 100644
+--- a/tools/profiler/platform.cpp
++++ b/tools/profiler/platform.cpp
+@@ -792,16 +792,20 @@ void mozilla_sampler_unlock()
+ {
+   nsCOMPtr<nsIObserverService> os = mozilla::services::GetObserverService();
+   if (os)
+     os->NotifyObservers(nullptr, "profiler-unlocked", nullptr);
+ }
+ 
+ bool mozilla_sampler_register_thread(const char* aName, void* stackTop)
+ {
++  if (sInitCount == 0) {
++    return false;
++  }
++
+ #if defined(MOZ_WIDGET_GONK) && !defined(MOZ_PROFILING)
+   // The only way to profile secondary threads on b2g
+   // is to build with profiling OR have the profiler
+   // running on startup.
+   if (!profiler_is_active()) {
+     return false;
+   }
+ #endif
+@@ -809,16 +813,20 @@ bool mozilla_sampler_register_thread(const char* aName, void* stackTop)
+   PseudoStack* stack = new PseudoStack();
+   tlsPseudoStack.set(stack);
+   bool isMainThread = is_main_thread_name(aName);
+   return Sampler::RegisterCurrentThread(aName, stack, isMainThread, stackTop);
+ }
+ 
+ void mozilla_sampler_unregister_thread()
+ {
++  if (sInitCount == 0) {
++    return;
++  }
++
+   Sampler::UnregisterCurrentThread();
+ 
+   PseudoStack *stack = tlsPseudoStack.get();
+   if (!stack) {
+     return;
+   }
+   delete stack;
+   tlsPseudoStack.set(nullptr);

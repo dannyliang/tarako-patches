@@ -1,0 +1,1836 @@
+diff --git a/b2g/app/B2GLoader.cpp b/b2g/app/B2GLoader.cpp
+new file mode 100644
+index 0000000..ac09401
+--- /dev/null
++++ b/b2g/app/B2GLoader.cpp
+@@ -0,0 +1,171 @@
++/* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set sw=2 ts=2 autoindent cindent expandtab: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
++ * You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "nsXULAppAPI.h"
++#include "nsXPCOMGlue.h"
++#include "nsStringGlue.h"
++#include "nsCOMPtr.h"
++#include "nsIFile.h"
++#include "BinaryPath.h"
++#include "nsAutoPtr.h"
++
++#include <stdio.h>
++#include <stdlib.h>
++#include <unistd.h>
++#include <fcntl.h>
++#include <sys/types.h>
++#include <sys/socket.h>
++
++#include <dlfcn.h>
++
++#include "nsXPCOMPrivate.h" // for MAXPATHLEN and XPCOM_DLL
++
++
++// Functions being loaded by XPCOMGlue
++XRE_ProcLoaderServiceRunType XRE_ProcLoaderServiceRun;
++XRE_ProcLoaderClientInitType XRE_ProcLoaderClientInit;
++
++static const nsDynamicFunctionLoad kXULFuncs[] = {
++  { "XRE_ProcLoaderServiceRun", (NSFuncPtr*) &XRE_ProcLoaderServiceRun },
++  { "XRE_ProcLoaderClientInit", (NSFuncPtr*) &XRE_ProcLoaderClientInit },
++  { nullptr, nullptr }
++};
++
++static bool
++getDirnameSlash(const char *aPath, char *aOutDir, int aMaxLen)
++{
++  char *lastSlash = strrchr(aPath, XPCOM_FILE_PATH_SEPARATOR[0]);
++  int cpsz = lastSlash - aPath + 1; // include slash
++  if (aMaxLen <= cpsz)
++    return true;
++  strncpy(aOutDir, aPath, cpsz);
++  aOutDir[cpsz] = 0;
++  return false;
++}
++
++static bool
++getXPCOMPath(const char *aProgram, char *aOutPath, int aMaxLen)
++{
++  nsAutoArrayPtr<char> progBuf;
++  progBuf = new char[aMaxLen];
++  nsresult rv = mozilla::BinaryPath::Get(aProgram, progBuf);
++  if (NS_FAILED(rv)) {
++    return true;
++  }
++
++  bool err = getDirnameSlash(progBuf, aOutPath, aMaxLen);
++  if (err) {
++    return true;
++  }
++
++  int dirSize = strlen(aOutPath);
++  if ((dirSize + sizeof(XPCOM_DLL) + 1) > aMaxLen)
++    return true;
++  char *afterSlash = aOutPath + dirSize;
++  strcpy(afterSlash, XPCOM_DLL);
++  return false;
++}
++
++static bool
++loadLibxul(const char *aXPCOMPath)
++{
++  nsresult rv;
++
++  XPCOMGlueEnablePreload();
++  rv = XPCOMGlueStartup(aXPCOMPath);
++  if (NS_FAILED(rv)) {
++    return true;
++  }
++
++  rv = XPCOMGlueLoadXULFunctions(kXULFuncs);
++  if (NS_FAILED(rv)) {
++    return true;
++  }
++
++  return false;
++}
++
++static bool
++loadStaticData(const char *aProgram)
++{
++  char xpcomPath[MAXPATHLEN];
++  bool err = getXPCOMPath(aProgram, xpcomPath, MAXPATHLEN);
++  if (err) return true;
++
++  err = loadLibxul(xpcomPath);
++  return err;
++}
++
++/**
++ * Fork and run parent and child process.
++ *
++ * The parent is the b2g process and child for Nuwa.
++ */
++static int
++runProcesses(int argc, const char *argv[])
++{
++  /*
++   * The original main() of the b2g process.  It is renamed to
++   * b2g_main() for the b2g loader.
++   */
++  int b2g_main(int argc, const char *argv[]);
++
++  int ipcSockets[2] = {-1, -1};
++  int r = socketpair(AF_LOCAL, SOCK_STREAM, 0, ipcSockets);
++  MOZ_ASSERT(r == 0);
++  int parentSock = ipcSockets[0];
++  int childSock = ipcSockets[1];
++
++  r = fcntl(parentSock, F_SETFL, O_NONBLOCK);
++  MOZ_ASSERT(r != -1);
++  r = fcntl(childSock, F_SETFL, O_NONBLOCK);
++  MOZ_ASSERT(r != -1);
++
++  pid_t pid = fork();
++  MOZ_ASSERT(pid >= 0);
++  bool isChildProcess = pid == 0;
++
++  close(isChildProcess ? parentSock : childSock);
++
++  if (isChildProcess) {
++    /* The Nuwa process */
++    /* This provides the IPC service of loading Nuwa at the process.
++     * The b2g process would send a IPC message of loading Nuwa
++     * as the replacement of forking and executing plugin-container.
++     */
++    return XRE_ProcLoaderServiceRun(getppid(), childSock, argc, argv);
++  }
++
++  // The b2g processes
++  int childPid = pid;
++  XRE_ProcLoaderClientInit(childPid, parentSock);
++  return b2g_main(argc, argv);
++}
++
++/**
++ * B2G Loader is responsible for loading of the b2g process and the
++ * Nuwa process.  It forks into the parent process, for the b2g
++ * process, and the child process, for the Nuwa process.
++ *
++ * The loader load libxul and doing initialization static data before
++ * forking, so relocation of libxul and static data could be shared
++ * among the b2g process, the Nuwa process, and content processes.
++ */
++int
++main(int argc, const char* argv[])
++{
++  const char *program = argv[0];
++  /*
++   * Before fork(), libxul and static data of Gecko are loaded for
++   * sharing.
++   */
++  bool err = loadStaticData(program);
++  if (err) {
++    return 255;
++  }
++
++  return runProcesses(argc, argv);
++}
+diff --git a/b2g/app/moz.build b/b2g/app/moz.build
+index cd85ac9..a33ab8d 100644
+--- a/b2g/app/moz.build
++++ b/b2g/app/moz.build
+@@ -4,16 +4,21 @@
+ # License, v. 2.0. If a copy of the MPL was not distributed with this
+ # file, You can obtain one at http://mozilla.org/MPL/2.0/.
+ 
+ if not CONFIG['LIBXUL_SDK']:
+     if CONFIG['GAIADIR']:
+         PROGRAM = CONFIG['MOZ_APP_NAME'] + "-bin"
+     else:
+         PROGRAM = CONFIG['MOZ_APP_NAME']
++    if CONFIG['MOZ_B2G_LOADER']:
++        SOURCES += [
++            'B2GLoader.cpp',
++        ]
++
+     SOURCES += [
+         'nsBrowserApp.cpp',
+     ]
+ 
+ if CONFIG['ENABLE_MARIONETTE']:
+     DEFINES['ENABLE_MARIONETTE'] = 1
+ 
+ DEFINES['XPCOM_GLUE'] = True
+diff --git a/b2g/app/nsBrowserApp.cpp b/b2g/app/nsBrowserApp.cpp
+index 83c2976..4e602ad 100644
+--- a/b2g/app/nsBrowserApp.cpp
++++ b/b2g/app/nsBrowserApp.cpp
+@@ -12,16 +12,17 @@
+ #elif defined(XP_UNIX)
+ #include <sys/time.h>
+ #include <sys/resource.h>
+ #include <unistd.h>
+ #endif
+ 
+ #include <stdio.h>
+ #include <stdarg.h>
++#include <string.h>
+ 
+ #include "nsCOMPtr.h"
+ #include "nsIFile.h"
+ #include "nsStringGlue.h"
+ 
+ #ifdef XP_WIN
+ // we want a wmain entry point
+ #include "nsWindowsWMain.cpp"
+@@ -158,39 +159,54 @@ static int do_main(int argc, char* argv[])
+     int result = XRE_main(argc, argv, appData, 0);
+     XRE_FreeAppData(appData);
+     return result;
+   }
+ 
+   return XRE_main(argc, argv, &sAppData, 0);
+ }
+ 
+-int main(int argc, char* argv[])
++#ifndef MOZ_B2G_LOADER
++#define MAIN main
++#else
++/*
++ * B2G loader is the main function instead of the main() here if it is
++ * enabled.  So, give a new name for the original main function.
++ */
++#define MAIN b2g_main
++#endif
++
++int MAIN(int argc, const char* argv[])
+ {
++#ifndef MOZ_B2G_LOADER
+   char exePath[MAXPATHLEN];
++#endif
+ 
+ #ifdef MOZ_WIDGET_GONK
+   // This creates a ThreadPool for binder ipc. A ThreadPool is necessary to
+   // receive binder calls, though not necessary to send binder calls.
+   // ProcessState::Self() also needs to be called once on the main thread to
+   // register the main thread with the binder driver.
+   android::ProcessState::self()->startThreadPool();
+ #endif
+ 
+-  nsresult rv = mozilla::BinaryPath::Get(argv[0], exePath);
++  nsresult rv;
++#ifndef MOZ_B2G_LOADER
++  rv = mozilla::BinaryPath::Get(argv[0], exePath);
+   if (NS_FAILED(rv)) {
+     Output("Couldn't calculate the application directory.\n");
+     return 255;
+   }
+ 
+   char *lastSlash = strrchr(exePath, XPCOM_FILE_PATH_SEPARATOR[0]);
+   if (!lastSlash || ((lastSlash - exePath) + sizeof(XPCOM_DLL) + 1 > MAXPATHLEN))
+     return 255;
+ 
+   strcpy(++lastSlash, XPCOM_DLL);
++#endif // MOZ_B2G_LOADER
+ 
+ #if defined(XP_UNIX)
+   // If the b2g app is launched from adb shell, then the shell will wind
+   // up being the process group controller. This means that we can't send
+   // signals to the process group (useful for profiling).
+   // We ignore the return value since setsid() fails if we're already the
+   // process group controller (the normal situation).
+   (void)setsid();
+@@ -200,26 +216,30 @@ int main(int argc, char* argv[])
+ #if defined(XP_UNIX)
+   struct rusage initialRUsage;
+   gotCounters = !getrusage(RUSAGE_SELF, &initialRUsage);
+ #elif defined(XP_WIN)
+   IO_COUNTERS ioCounters;
+   gotCounters = GetProcessIoCounters(GetCurrentProcess(), &ioCounters);
+ #endif
+ 
++  // For B2G loader have initialized Gecko, here is no more used if
++  // B2g loader is enabled.
++#ifndef MOZ_B2G_LOADER
+   // We do this because of data in bug 771745
+   XPCOMGlueEnablePreload();
+ 
+   rv = XPCOMGlueStartup(exePath);
+   if (NS_FAILED(rv)) {
+     Output("Couldn't load XPCOM.\n");
+     return 255;
+   }
+   // Reset exePath so that it is the directory name and not the xpcom dll name
+   *lastSlash = 0;
++#endif // MOZ_B2G_LOADER
+ 
+   rv = XPCOMGlueLoadXULFunctions(kXULFuncs);
+   if (NS_FAILED(rv)) {
+     Output("Couldn't load XRE functions.\n");
+     return 255;
+   }
+ 
+ #ifdef HAS_DLL_BLOCKLIST
+@@ -248,13 +268,27 @@ int main(int argc, char* argv[])
+                               int(newRUsage.ru_majflt - initialRUsage.ru_majflt));
+     }
+ #endif
+   }
+ 
+   int result;
+   {
+     ScopedLogging log;
+-    result = do_main(argc, argv);
++    char **_argv;
++
++    _argv = new char *[argc + 1];
++    for (int i = 0; i < argc; i++) {
++      _argv[i] = strdup(argv[i]);
++      MOZ_ASSERT(_argv[i] != nullptr);
++    }
++    _argv[argc] = nullptr;
++
++    result = do_main(argc, _argv);
++
++    for (int i = 0; i < argc; i++) {
++      free(_argv[i]);
++    }
++    delete _argv;
+   }
+ 
+   return result;
+ }
+diff --git a/b2g/confvars.sh b/b2g/confvars.sh
+index 7497080..aa7dcd7 100644
+--- a/b2g/confvars.sh
++++ b/b2g/confvars.sh
+@@ -53,10 +53,11 @@ MOZ_TIME_MANAGER=1
+ MOZ_B2G_CERTDATA=1
+ MOZ_PAY=1
+ MOZ_TOOLKIT_SEARCH=
+ MOZ_PLACES=
+ MOZ_B2G=1
+ 
+ if test "$OS_TARGET" = "Android"; then
+ MOZ_NUWA_PROCESS=1
++MOZ_B2G_LOADER=1
+ fi
+ MOZ_FOLD_LIBS=1
+diff --git a/configure.in b/configure.in
+index f15a801..1c38718 100644
+--- a/configure.in
++++ b/configure.in
+@@ -8549,16 +8549,24 @@ AC_SUBST(MOZ_BZ2_LIBS)
+ AC_SUBST(MOZ_PNG_CFLAGS)
+ AC_SUBST(MOZ_PNG_LIBS)
+ 
+ if test "$MOZ_WIDGET_TOOLKIT" = gonk -a -n "$MOZ_NUWA_PROCESS"; then
+     export MOZ_NUWA_PROCESS
+     AC_DEFINE(MOZ_NUWA_PROCESS)
+ fi
+ AC_SUBST(MOZ_NUWA_PROCESS)
++if test "$MOZ_WIDGET_TOOLKIT" = gonk -a -n "$MOZ_B2G_LOADER"; then
++    if test -z "$MOZ_NUWA_PROCESS"; then
++       AC_MSG_ERROR([B2G loader is only work with Nuwa]);
++    fi
++    export MOZ_B2G_LOADER
++    AC_DEFINE(MOZ_B2G_LOADER)
++fi
++AC_SUBST(MOZ_B2G_LOADER)
+ 
+ AC_SUBST(NSPR_CFLAGS)
+ AC_SUBST(NSPR_LIBS)
+ AC_SUBST(MOZ_NATIVE_NSPR)
+ 
+ AC_SUBST(NSS_CFLAGS)
+ AC_SUBST(NSS_LIBS)
+ AC_SUBST(MOZ_NATIVE_NSS)
+diff --git a/ipc/app/Makefile.in b/ipc/app/Makefile.in
+index 2904e5a..4ef0f8a 100644
+--- a/ipc/app/Makefile.in
++++ b/ipc/app/Makefile.in
+@@ -44,16 +44,20 @@ ifdef _MSC_VER
+ # a console application.
+ WIN32_EXE_LDFLAGS += -ENTRY:wmainCRTStartup
+ endif
+ 
+ include $(topsrcdir)/config/rules.mk
+ 
+ LDFLAGS += $(MOZ_ALLOW_HEAP_EXECUTE_FLAGS)
+ 
++ifneq ($(MOZ_WIDGET_TOOLKIT),android)
++LIBS += ../contentproc/$(LIB_PREFIX)plugin-container.$(LIB_SUFFIX)
++endif
++
+ ifeq ($(OS_ARCH),WINNT) #{
+ 
+ ifdef MOZ_CONTENT_SANDBOX
+ LIBS += ../../security/sandbox/$(LIB_PREFIX)sandbox_s.$(LIB_SUFFIX)
+ LIBS += $(NSPR_LIBS)
+ LOCAL_INCLUDES += \
+   -I$(topsrcdir)/security/sandbox \
+   -I$(topsrcdir)/security/ \
+diff --git a/ipc/app/MozillaRuntimeMain.cpp b/ipc/app/MozillaRuntimeMain.cpp
+index fdf008a..ef50c67 100644
+--- a/ipc/app/MozillaRuntimeMain.cpp
++++ b/ipc/app/MozillaRuntimeMain.cpp
+@@ -1,141 +1,12 @@
+ /* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*-
+  * vim: sw=4 ts=4 et :
+  * This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+-#include "nsXPCOM.h"
+-#include "nsXULAppAPI.h"
+-
+-// FIXME/cjones testing
+-#if !defined(OS_WIN)
+-#include <unistd.h>
+-#endif
+-
+-#ifdef XP_WIN
+-#include <windows.h>
+-// we want a wmain entry point
+-// but we don't want its DLL load protection, because we'll handle it here
+-#define XRE_DONT_PROTECT_DLL_LOAD
+-#include "nsWindowsWMain.cpp"
+-#include "nsSetDllDirectory.h"
+-#endif
+-
+-#if defined(XP_WIN) && defined(MOZ_CONTENT_SANDBOX)
+-#include "sandbox/base/basictypes.h"
+-#include "sandbox/win/src/sandbox.h"
+-#include "sandbox/win/src/sandbox_factory.h"
+-#endif
+-
+-#ifdef MOZ_WIDGET_GONK
+-# include <sys/time.h>
+-# include <sys/resource.h> 
+-
+-# include <binder/ProcessState.h>
+-
+-# ifdef LOGE_IF
+-#  undef LOGE_IF
+-# endif
+-
+-# include <android/log.h>
+-# define LOGE_IF(cond, ...) \
+-     ( (CONDITION(cond)) \
+-     ? ((void)__android_log_print(ANDROID_LOG_ERROR, \
+-       "Gecko:MozillaRntimeMain", __VA_ARGS__)) \
+-     : (void)0 )
+-
+-#endif
+-
+-#ifdef MOZ_NUWA_PROCESS
+-#include <binder/ProcessState.h>
+-#include "ipc/Nuwa.h"
+-#endif
+-
+-#ifdef MOZ_WIDGET_GONK
+-static void
+-InitializeBinder(void *aDummy) {
+-    // Change thread priority to 0 only during calling ProcessState::self().
+-    // The priority is registered to binder driver and used for default Binder
+-    // Thread's priority. 
+-    // To change the process's priority to small value need's root permission.
+-    int curPrio = getpriority(PRIO_PROCESS, 0);
+-    int err = setpriority(PRIO_PROCESS, 0, 0);
+-    MOZ_ASSERT(!err);
+-    LOGE_IF(err, "setpriority failed. Current process needs root permission.");
+-    android::ProcessState::self()->startThreadPool();
+-    setpriority(PRIO_PROCESS, 0, curPrio);
+-}
+-#endif
+-
++extern int content_process_main(int argc, char *argv[]);
++ 
+ int
+-main(int argc, char* argv[])
+-{
+-    bool isNuwa = false;
+-    bool isSandboxEnabled = false;
+-    for (int i = 1; i < argc; i++) {
+-        isNuwa |= strcmp(argv[i], "-nuwa") == 0;
+-        isSandboxEnabled |= strcmp(argv[i], "-sandbox") == 0;
+-    }
+-
+-#ifdef MOZ_NUWA_PROCESS
+-    if (isNuwa) {
+-        PrepareNuwaProcess();
+-    }
+-#endif
+-
+-#ifdef MOZ_WIDGET_GONK
+-    // This creates a ThreadPool for binder ipc. A ThreadPool is necessary to
+-    // receive binder calls, though not necessary to send binder calls.
+-    // ProcessState::Self() also needs to be called once on the main thread to
+-    // register the main thread with the binder driver.
+-
+-#ifdef MOZ_NUWA_PROCESS
+-    if (!isNuwa) {
+-        InitializeBinder(nullptr);
+-    } else {
+-        NuwaAddFinalConstructor(&InitializeBinder, nullptr);
+-    }
+-#else
+-    InitializeBinder(nullptr);
+-#endif
+-#endif
+-
+-#if defined(XP_WIN) && defined(MOZ_CONTENT_SANDBOX)
+-    if (isSandboxEnabled) {
+-        sandbox::TargetServices* target_service =
+-            sandbox::SandboxFactory::GetTargetServices();
+-        if (!target_service) {
+-            return 1;
+-        }
+-
+-        sandbox::ResultCode result = target_service->Init();
+-        if (result != sandbox::SBOX_ALL_OK) {
+-            return 2;
+-        }
+-
+-        // Initialization is finished, switch to the lowered token
+-        target_service->LowerToken();
+-    }
+-#endif
+-
+-    // Check for the absolute minimum number of args we need to move
+-    // forward here. We expect the last arg to be the child process type.
+-    if (argc < 1)
+-      return 3;
+-    GeckoProcessType proctype = XRE_StringToChildProcessType(argv[--argc]);
+-
+-#ifdef XP_WIN
+-    // For plugins, this is done in PluginProcessChild::Init, as we need to
+-    // avoid it for unsupported plugins.  See PluginProcessChild::Init for
+-    // the details.
+-    if (proctype != GeckoProcessType_Plugin) {
+-        mozilla::SanitizeEnvironmentVariables();
+-        SetDllDirectory(L"");
+-    }
+-#endif
+-
+-    nsresult rv = XRE_InitChildProcess(argc, argv, proctype);
+-    NS_ENSURE_SUCCESS(rv, 1);
+-
+-    return 0;
++main(int argc, char *argv[]) {
++    return content_process_main(argc, argv);
+ }
+diff --git a/ipc/chromium/src/base/process_util_linux.cc b/ipc/chromium/src/base/process_util_linux.cc
+index 5b95525..5e75c94 100644
+--- a/ipc/chromium/src/base/process_util_linux.cc
++++ b/ipc/chromium/src/base/process_util_linux.cc
+@@ -1,8 +1,10 @@
++/* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set sw=2 ts=2 autoindent cindent expandtab: */
+ // Copyright (c) 2008 The Chromium Authors. All rights reserved.
+ // Use of this source code is governed by a BSD-style license that can be
+ // found in the LICENSE file.
+ 
+ #include "base/process_util.h"
+ 
+ #include <ctype.h>
+ #include <dirent.h>
+@@ -14,16 +16,23 @@
+ #include <sys/wait.h>
+ 
+ #include "base/debug_util.h"
+ #include "base/eintr_wrapper.h"
+ #include "base/file_util.h"
+ #include "base/logging.h"
+ #include "base/string_tokenizer.h"
+ #include "base/string_util.h"
++#include "nsLiteralString.h"
++
++#ifdef MOZ_B2G_LOADER
++#include "ProcessUtils.h"
++
++using namespace mozilla::ipc;
++#endif	// MOZ_B2G_LOADER
+ 
+ #ifdef MOZ_WIDGET_GONK
+ /*
+  * AID_APP is the first application UID used by Android. We're using
+  * it as our unprivilegied UID.  This ensure the UID used is not
+  * shared with any other processes than our own childs.
+  */
+ # include <private/android_filesystem_config.h>
+@@ -184,22 +193,84 @@ bool LaunchApp(const std::vector<std::string>& argv,
+                const environment_map& env_vars_to_set,
+                bool wait, ProcessHandle* process_handle,
+                ProcessArchitecture arch) {
+   return LaunchApp(argv, fds_to_remap, env_vars_to_set,
+                    PRIVILEGES_INHERIT,
+                    wait, process_handle);
+ }
+ 
++#ifdef MOZ_B2G_LOADER
++/**
++ * Launch an app using B2g Loader.
++ */
++static bool
++LaunchAppProcLoader(const std::vector<std::string>& argv,
++                    const file_handle_mapping_vector& fds_to_remap,
++                    const environment_map& env_vars_to_set,
++                    ChildPrivileges privs,
++                    ProcessHandle* process_handle) {
++  size_t i;
++  scoped_array<char*> argv_cstr(new char*[argv.size() + 1]);
++  for (i = 0; i < argv.size(); i++) {
++    argv_cstr[i] = const_cast<char*>(argv[i].c_str());
++  }
++  argv_cstr[argv.size()] = NULL;
++
++  scoped_array<char*> env_cstr(new char*[env_vars_to_set.size()]);
++  i = 0;
++  for (environment_map::const_iterator it = env_vars_to_set.begin();
++       it != env_vars_to_set.end(); ++it) {
++    env_cstr[i++] = strdup((it->first + "=" + it->second).c_str());
++  }
++  env_cstr[env_vars_to_set.size()] = nullptr;
++
++  bool ok = ProcLoaderLoad((const char **)argv_cstr.get(),
++                           (const char **)env_cstr.get(),
++                           fds_to_remap, privs,
++                           process_handle);
++  MOZ_ASSERT(ok, "ProcLoaderLoad() failed");
++
++  for (size_t i = 0; i < env_vars_to_set.size(); i++) {
++    free(env_cstr[i]);
++  }
++
++  return ok;
++}
++
++#ifdef DEBUG
++static bool
++IsLaunchingNuwa(const std::vector<std::string>& argv) {
++  std::vector<std::string>>::const_iterator it;
++  for (it = argv.begin(); it != argv.end(); ++it) {
++    if (argv[i] == NS_LITERAL_STRING("-nuwa")) {
++      return true;
++    }
++  }
++  return false;
++}
++#endif
++#endif // MOZ_B2G_LOADER
++
+ bool LaunchApp(const std::vector<std::string>& argv,
+                const file_handle_mapping_vector& fds_to_remap,
+                const environment_map& env_vars_to_set,
+                ChildPrivileges privs,
+                bool wait, ProcessHandle* process_handle,
+                ProcessArchitecture arch) {
++#ifdef MOZ_B2G_LOADER
++  static bool firstTimeLaunch = true;
++  if (!wait && firstTimeLaunch) {
++    MOZ_ASSERT(IsLaunchingNuwa(argv));
++    firstTimeLaunch = false;
++    return LaunchAppProcLoader(argv, fds_to_remap, env_vars_to_set,
++                               privs, process_handle);
++  }
++#endif // MOZ_B2G_LOADER
++
+   scoped_array<char*> argv_cstr(new char*[argv.size() + 1]);
+   // Illegal to allocate memory after fork and before execvp
+   InjectiveMultimap fd_shuffle1, fd_shuffle2;
+   fd_shuffle1.reserve(fds_to_remap.size());
+   fd_shuffle2.reserve(fds_to_remap.size());
+ 
+ #ifdef HAVE_PR_DUPLICATE_ENVIRONMENT
+   Environment env;
+diff --git a/ipc/contentproc/moz.build b/ipc/contentproc/moz.build
+new file mode 100644
+index 0000000..18c6541
+--- /dev/null
++++ b/ipc/contentproc/moz.build
+@@ -0,0 +1,23 @@
++# -*- Mode: python; c-basic-offset: 4; indent-tabs-mode: nil; tab-width: 40 -*-
++# vim: set filetype=python:
++# This Source Code Form is subject to the terms of the Mozilla Public
++# License, v. 2.0. If a copy of the MPL was not distributed with this
++# file, You can obtain one at http://mozilla.org/MPL/2.0/.
++
++LIBRARY_NAME = 'plugin-container'
++if CONFIG['MOZ_B2G_LOADER']:
++    FINAL_LIBRARY = 'xul'
++
++SOURCES += [
++    'plugin-container.cpp',
++]
++
++include('/ipc/chromium/chromium-config.mozbuild')
++
++if CONFIG['MOZ_CONTENT_SANDBOX'] and CONFIG['OS_ARCH'] == 'WINNT':
++    # For sandbox includes and the include dependencies those have
++    LOCAL_INCLUDES += [
++        '/security',
++        '/security/sandbox',
++        '/security/sandbox/chromium',
++    ]
+diff --git a/ipc/contentproc/plugin-container.cpp b/ipc/contentproc/plugin-container.cpp
+new file mode 100644
+index 0000000..ef7dedd
+--- /dev/null
++++ b/ipc/contentproc/plugin-container.cpp
+@@ -0,0 +1,141 @@
++/* -*- Mode: C++; tab-width: 4; indent-tabs-mode: nil; c-basic-offset: 4 -*-
++ * vim: sw=4 ts=4 et :
++ * This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this
++ * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++#include "nsXPCOM.h"
++#include "nsXULAppAPI.h"
++
++// FIXME/cjones testing
++#if !defined(OS_WIN)
++#include <unistd.h>
++#endif
++
++#ifdef XP_WIN
++#include <windows.h>
++// we want a wmain entry point
++// but we don't want its DLL load protection, because we'll handle it here
++#define XRE_DONT_PROTECT_DLL_LOAD
++#include "nsWindowsWMain.cpp"
++#include "nsSetDllDirectory.h"
++#endif
++
++#if defined(XP_WIN) && defined(MOZ_CONTENT_SANDBOX)
++#include "sandbox/base/basictypes.h"
++#include "sandbox/win/src/sandbox.h"
++#include "sandbox/win/src/sandbox_factory.h"
++#endif
++
++#ifdef MOZ_WIDGET_GONK
++# include <sys/time.h>
++# include <sys/resource.h> 
++
++# include <binder/ProcessState.h>
++
++# ifdef LOGE_IF
++#  undef LOGE_IF
++# endif
++
++# include <android/log.h>
++# define LOGE_IF(cond, ...) \
++     ( (CONDITION(cond)) \
++     ? ((void)__android_log_print(ANDROID_LOG_ERROR, \
++       "Gecko:MozillaRntimeMain", __VA_ARGS__)) \
++     : (void)0 )
++
++#endif
++
++#ifdef MOZ_NUWA_PROCESS
++#include <binder/ProcessState.h>
++#include "ipc/Nuwa.h"
++#endif
++
++#ifdef MOZ_WIDGET_GONK
++static void
++InitializeBinder(void *aDummy) {
++    // Change thread priority to 0 only during calling ProcessState::self().
++    // The priority is registered to binder driver and used for default Binder
++    // Thread's priority. 
++    // To change the process's priority to small value need's root permission.
++    int curPrio = getpriority(PRIO_PROCESS, 0);
++    int err = setpriority(PRIO_PROCESS, 0, 0);
++    MOZ_ASSERT(!err);
++    LOGE_IF(err, "setpriority failed. Current process needs root permission.");
++    android::ProcessState::self()->startThreadPool();
++    setpriority(PRIO_PROCESS, 0, curPrio);
++}
++#endif
++
++int
++content_process_main(int argc, char* argv[])
++{
++    bool isNuwa = false;
++    bool isSandboxEnabled = false;
++    for (int i = 1; i < argc; i++) {
++        isNuwa |= strcmp(argv[i], "-nuwa") == 0;
++        isSandboxEnabled |= strcmp(argv[i], "-sandbox") == 0;
++    }
++
++#ifdef MOZ_NUWA_PROCESS
++    if (isNuwa) {
++        PrepareNuwaProcess();
++    }
++#endif
++
++#ifdef MOZ_WIDGET_GONK
++    // This creates a ThreadPool for binder ipc. A ThreadPool is necessary to
++    // receive binder calls, though not necessary to send binder calls.
++    // ProcessState::Self() also needs to be called once on the main thread to
++    // register the main thread with the binder driver.
++
++#ifdef MOZ_NUWA_PROCESS
++    if (!isNuwa) {
++        InitializeBinder(nullptr);
++    } else {
++        NuwaAddFinalConstructor(&InitializeBinder, nullptr);
++    }
++#else
++    InitializeBinder(nullptr);
++#endif
++#endif
++
++#if defined(XP_WIN) && defined(MOZ_CONTENT_SANDBOX)
++    if (isSandboxEnabled) {
++        sandbox::TargetServices* target_service =
++            sandbox::SandboxFactory::GetTargetServices();
++        if (!target_service) {
++            return 1;
++        }
++
++        sandbox::ResultCode result = target_service->Init();
++        if (result != sandbox::SBOX_ALL_OK) {
++            return 2;
++        }
++
++        // Initialization is finished, switch to the lowered token
++        target_service->LowerToken();
++    }
++#endif
++
++    // Check for the absolute minimum number of args we need to move
++    // forward here. We expect the last arg to be the child process type.
++    if (argc < 1)
++      return 3;
++    GeckoProcessType proctype = XRE_StringToChildProcessType(argv[--argc]);
++
++#ifdef XP_WIN
++    // For plugins, this is done in PluginProcessChild::Init, as we need to
++    // avoid it for unsupported plugins.  See PluginProcessChild::Init for
++    // the details.
++    if (proctype != GeckoProcessType_Plugin) {
++        mozilla::SanitizeEnvironmentVariables();
++        SetDllDirectory(L"");
++    }
++#endif
++
++    nsresult rv = XRE_InitChildProcess(argc, argv, proctype);
++    NS_ENSURE_SUCCESS(rv, 1);
++
++    return 0;
++}
+diff --git a/ipc/glue/PProcLoader.ipdl b/ipc/glue/PProcLoader.ipdl
+new file mode 100644
+index 0000000..bbfe3b0
+--- /dev/null
++++ b/ipc/glue/PProcLoader.ipdl
+@@ -0,0 +1,35 @@
++/* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set sw=2 ts=2 autoindent cindent expandtab: */
++/* This Source Code Form is subject to the terms of the Mozilla Public
++ * License, v. 2.0. If a copy of the MPL was not distributed with this file,
++ * You can obtain one at http://mozilla.org/MPL/2.0/. */
++
++namespace mozilla {
++namespace ipc {
++
++struct FDRemap {
++  FileDescriptor fd;
++  int mapto;
++};
++
++protocol PProcLoader
++{
++child:
++  /**
++   * Request B2G loader service to load content process.
++   *
++   * It actually calls the main() function of plugin-container.
++   */
++  async Load(nsCString[] argv, nsCString[] env,
++             FDRemap[] fdsRemap, uint32_t privs,
++             int32_t cookie);
++
++parent:
++  /**
++   * The acknowledge of Load().
++   */
++  async LoadComplete(int32_t pid, int32_t cookie);
++};
++
++}
++}
+diff --git a/ipc/glue/ProcessUtils.h b/ipc/glue/ProcessUtils.h
+index fc17609..0bbff61 100644
+--- a/ipc/glue/ProcessUtils.h
++++ b/ipc/glue/ProcessUtils.h
+@@ -1,19 +1,35 @@
++/* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set sw=2 ts=2 autoindent cindent expandtab: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #ifndef mozilla_ipc_ProcessUtils_h
+ #define mozilla_ipc_ProcessUtils_h
+ 
++#ifdef MOZ_B2G_LOADER
++#include "base/process_util.h"
++#endif
++
+ namespace mozilla {
+ namespace ipc {
+ 
+ // You probably should call ContentChild::SetProcessName instead of calling
+ // this directly.
+ void SetThisProcessName(const char *aName);
+ 
++#ifdef MOZ_B2G_LOADER
++void ProcLoaderClientGeckoInit();
++
++bool ProcLoaderLoad(const char *aArgv[],
++                    const char *aEnvp[],
++                    const base::file_handle_mapping_vector &aFdsRemap,
++                    const base::ChildPrivileges aPrivs,
++                    base::ProcessHandle *aProcessHandle);
++#endif /* MOZ_B2G_LOADER */
++
+ } // namespace ipc
+ } // namespace mozilla
+ 
+ #endif // ifndef mozilla_ipc_ProcessUtils_h
+ 
+diff --git a/ipc/glue/ProcessUtils_linux.cpp b/ipc/glue/ProcessUtils_linux.cpp
+index d5b8c09..d6933de 100644
+--- a/ipc/glue/ProcessUtils_linux.cpp
++++ b/ipc/glue/ProcessUtils_linux.cpp
+@@ -1,20 +1,523 @@
++/* -*- Mode: C++; tab-width: 2; indent-tabs-mode: nil; c-basic-offset: 2 -*- */
++/* vim: set sw=2 ts=2 autoindent cindent expandtab: */
+ /* This Source Code Form is subject to the terms of the Mozilla Public
+  * License, v. 2.0. If a copy of the MPL was not distributed with this
+  * file, You can obtain one at http://mozilla.org/MPL/2.0/. */
+ 
+ #include "ProcessUtils.h"
+ 
+ #include "nsString.h"
+ 
+ #include <sys/prctl.h>
+ 
++#ifdef MOZ_B2G_LOADER
++
++#include <sys/types.h>
++#include <unistd.h>
++
++#include "nsAutoPtr.h"
++
++#include "mozilla/Assertions.h"
++#include "mozilla/ipc/PProcLoaderParent.h"
++#include "mozilla/ipc/PProcLoaderChild.h"
++#include "mozilla/ipc/Transport.h"
++#include "mozilla/ipc/FileDescriptorUtils.h"
++#include "mozilla/ipc/IOThreadChild.h"
++#include "mozilla/dom/ContentProcess.h"
++#include "base/file_descriptor_shuffle.h"
++#include "mozilla/BackgroundHangMonitor.h"
++#include "mozilla/DebugOnly.h"
++#include "base/process_util.h"
++
++#include "prenv.h"
++
++#include "nsXULAppAPI.h" // export XRE_* functions
++
++#include "nsAppRunner.h"
++
++int content_process_main(int argc, char *argv[]);
++
++#endif /* MOZ_B2G_LOADER */
++
+ namespace mozilla {
+ namespace ipc {
+ 
+ void SetThisProcessName(const char *aName)
+ {
+   prctl(PR_SET_NAME, (unsigned long)aName, 0uL, 0uL, 0uL);
+ }
+ 
++#ifdef MOZ_B2G_LOADER
++/**
++ * How does B2G Loader Work?
++ *
++ *  <<parent process>>      <<child process>>
++ *   ProcLoaderParent -----> ProcLoaderChild
++ *         ^                       |
++ *         | load()                | content_process_main()
++ *         |                       V
++ *     ProcLoaderClient      Nuwa/plugin-container
++ *         ^
++ *         | ProcLoaderLoad()
++ *        ...
++ *     ContentParent
++ *
++ * B2G loader includes an IPC protocol PProcLoader for communication
++ * between client (parent) and server (child).  The b2g process is the
++ * client, it request the server to load/start Nuwa process with give
++ * the arguments, env variables, and file descriptions.
++ *
++ * ProcLoaderClientInit() is called by B2G loader to initialize client
++ * side, the b2g process.  Then, the b2g_main() is called to start b2g
++ * process.
++ *
++ * ProcLoaderClientGeckoInit() is called by XRE_main() to create the
++ * parent actor, |ProcLoaderParent|, of PProcLoader for serving the
++ * request of running Nuwa process later, once Gecko have been
++ * initialized.
++ *
++ * ProcLoaderServiceRun() is called by the server process.  It starts
++ * an IOThread and event loop to serve the |ProcLoaderChild|
++ * implmentation of PProcLoader protocol as the child actor.  Once it
++ * recieves a load() request, it stops the IOThread and event loop,
++ * then start running the main function of the content process as the
++ * Nuwa process according the arguments.
++ *
++ * NOTE: The server process serves at most one load() request.
++ */
++
++using namespace base;
++using namespace mozilla::dom;
++
++static bool sProcLoaderClientOnDeinit = false;
++static DebugOnly<bool> sProcLoaderClientInitialized = false;
++static DebugOnly<bool> sProcLoaderClientGeckoInitialized = false;
++static pid_t sProcLoaderPid = 0;
++static int sProcLoaderChannelFd = -1;
++static PProcLoaderParent *sProcLoaderParent = nullptr;
++
++static void ProcLoaderClientDeinit();
++
++
++class ProcLoaderParent : public PProcLoaderParent
++{
++private:
++  nsAutoPtr<FileDescriptor> mFd;
++
++public:
++  ProcLoaderParent(FileDescriptor *aFd) : mFd(aFd) {}
++
++  virtual void ActorDestroy(ActorDestroyReason aWhy) MOZ_OVERRIDE;
++
++  virtual bool RecvLoadComplete(const int32_t &aPid,
++                                const int32_t &aCookie) MOZ_OVERRIDE;
++
++  virtual void OnChannelError() MOZ_OVERRIDE;
++};
++
++void
++ProcLoaderParent::ActorDestroy(ActorDestroyReason aWhy)
++{
++}
++
++static void
++_ProcLoaderParentDestroy(PProcLoaderParent *aLoader)
++{
++  aLoader->Close();
++  delete aLoader;
++  sProcLoaderClientOnDeinit = false;
++}
++
++bool
++ProcLoaderParent::RecvLoadComplete(const int32_t &aPid,
++                                   const int32_t &aCookie)
++{
++  ProcLoaderClientDeinit();
++  return true;
++}
++
++void
++ProcLoaderParent::OnChannelError()
++{
++  if (sProcLoaderClientOnDeinit) {
++    // Get error for closing while the channel is already error.
++    return;
++  }
++  ProcLoaderClientDeinit();
++}
++
++/**
++ * Initialize the client of B2G loader for loader itself.
++ *
++  * The initialization of B2G loader are divided into two stages. First
++ * stage is to collect child info passed from the main program of the
++ * loader.  2nd stage is to initialize Gecko according info from the
++ * first stage and making the client of loader service ready.
++ *
++ * \param aPeerPid is the pid of the child.
++ * \param aChannelFd is the file descriptor of the socket used for IPC.
++ */
++static void
++ProcLoaderClientInit(pid_t aPeerPid, int aChannelFd)
++{
++  MOZ_ASSERT(!sProcLoaderClientInitialized, "call ProcLoaderClientInit() more than once");
++  MOZ_ASSERT(aPeerPid != 0 && aChannelFd == -1, "invalid argument");
++  sProcLoaderPid = aPeerPid;
++  sProcLoaderChannelFd = aChannelFd;
++  sProcLoaderClientInitialized = true;
++}
++
++/**
++ * Initialize the client of B2G loader for Gecko.
++ */
++void
++ProcLoaderClientGeckoInit()
++{
++  MOZ_ASSERT(sProcLoaderClientInitialized, "call ProcLoaderClientInit() at first");
++  MOZ_ASSERT(!sProcLoaderClientGeckoInitialized,
++             "call ProcLoaderClientGeckoInit() more than once");
++
++  sProcLoaderClientGeckoInitialized = true;
++
++  FileDescriptor *fd = new FileDescriptor(sProcLoaderChannelFd);
++  close(sProcLoaderChannelFd);
++  sProcLoaderChannelFd = -1;
++  Transport *transport = OpenDescriptor(*fd, Transport::MODE_CLIENT);
++  sProcLoaderParent = new ProcLoaderParent(fd);
++  sProcLoaderParent->Open(transport,
++                          sProcLoaderPid,
++                          XRE_GetIOMessageLoop(),
++                          ParentSide);
++}
++
++/**
++ * Shutdown and destroy the client of B2G loader service.
++ */
++static void
++ProcLoaderClientDeinit()
++{
++  MOZ_ASSERT(sProcLoaderClientGeckoInitialized && sProcLoaderClientInitialized);
++  sProcLoaderClientGeckoInitialized = false;
++  sProcLoaderClientInitialized = false;
++
++  sProcLoaderClientOnDeinit = true;
++
++  MOZ_ASSERT(sProcLoaderParent != nullptr);
++  PProcLoaderParent *procLoaderParent = sProcLoaderParent;
++  sProcLoaderParent = nullptr;
++
++  MessageLoop::current()->
++    PostTask(FROM_HERE,
++             NewRunnableFunction(&_ProcLoaderParentDestroy,
++                                 procLoaderParent));
++}
++
++/**
++ * Request the loader service, the server, to load Nuwa.
++ */
++bool
++ProcLoaderLoad(const char *aArgv[],
++               const char *aEnvp[],
++               const file_handle_mapping_vector &aFdsRemap,
++               const ChildPrivileges aPrivs,
++               ProcessHandle *aProcessHandle)
++{
++  static int cookie=0;
++  int i;
++
++  PProcLoaderParent *loader = sProcLoaderParent;
++  if (loader == nullptr) {
++    return false;
++  }
++
++  nsTArray<nsCString> argv;
++  for (i = 0; aArgv[i] != nullptr; i++) {
++    argv.AppendElement(nsCString(aArgv[i]));
++  }
++  nsTArray<nsCString> env;
++  for (i = 0; aEnvp[i] != nullptr; i++) {
++    env.AppendElement(nsCString(aEnvp[i]));
++  }
++  nsTArray<FDRemap> fdsremap;
++  for (file_handle_mapping_vector::const_iterator fdmap =
++         aFdsRemap.begin();
++       fdmap != aFdsRemap.end();
++       fdmap++) {
++    fdsremap.AppendElement(FDRemap(fdmap->first, fdmap->second));
++  }
++
++  bool ok = loader->SendLoad(argv, env, fdsremap, aPrivs,
++                             cookie++);
++  if (ok) {
++    MOZ_ASSERT(sProcLoaderPid != 0);
++    *aProcessHandle = sProcLoaderPid;
++    sProcLoaderPid = 0;
++  }
++
++  return ok;
++}
++
++
++class ProcLoaderRunnerBase;
++
++static bool sProcLoaderServing = false;
++static ProcLoaderRunnerBase *sProcLoaderDispatchedTask = nullptr;
++
++class ProcLoaderRunnerBase
++{
++public:
++  virtual int DoWork() = 0;
++};
++
++
++class ProcLoaderNoopRunner : public ProcLoaderRunnerBase {
++public:
++  virtual int DoWork();
++};
++
++int
++ProcLoaderNoopRunner::DoWork() {
++  return 0;
++}
++
++
++/**
++ * The runner to load Nuwa at the current process.
++ */
++class ProcLoaderLoadRunner : public ProcLoaderRunnerBase {
++private:
++  const nsTArray<nsCString> mArgv;
++  const nsTArray<nsCString> mEnv;
++  const nsTArray<FDRemap> mFdsRemap;
++  const ChildPrivileges mPrivs;
++
++  void ArrangeFds();
++
++public:
++  ProcLoaderLoadRunner(const InfallibleTArray<nsCString>& aArgv,
++                       const InfallibleTArray<nsCString>& aEnv,
++                       const InfallibleTArray<FDRemap>& aFdsRemap,
++                       const ChildPrivileges aPrivs)
++    : mArgv(aArgv)
++    , mEnv(aEnv)
++    , mFdsRemap(aFdsRemap)
++    , mPrivs(aPrivs) {}
++
++  int DoWork();
++};
++
++void
++ProcLoaderLoadRunner::ArrangeFds()
++{
++  unsigned int i;
++
++  InjectiveMultimap fd_shuffle1, fd_shuffle2;
++  fd_shuffle1.reserve(mFdsRemap.Length());
++  fd_shuffle2.reserve(mFdsRemap.Length());
++  for (i = 0; i < mFdsRemap.Length(); i++) {
++    const FDRemap *map = &mFdsRemap[i];
++    int fd = map->fd().PlatformHandle();
++    int tofd = map->mapto();
++
++    fd_shuffle1.push_back(InjectionArc(fd, tofd, false));
++    fd_shuffle2.push_back(InjectionArc(fd, tofd, false));
++  }
++
++  DebugOnly<nsresult> rv = ShuffleFileDescriptors(&fd_shuffle1);
++  MOZ_ASSERT(NS_SUCCEEDED(rv), "ShuffleFileDescriptors failed");
++
++  CloseSuperfluousFds(fd_shuffle2);
++}
++
++int
++ProcLoaderLoadRunner::DoWork()
++{
++  unsigned int i;
++
++  ArrangeFds();
++
++  unsigned int argc = mArgv.Length();
++  char **argv = new char *[argc + 1];
++  for (i = 0; i < argc; i++) {
++    argv[i] = ::strdup(mArgv[i].get());
++  }
++  argv[argc] = nullptr;
++
++  unsigned int envc = mEnv.Length();
++  for (i = 0; i < envc; i++) {
++    PR_SetEnv(mEnv[i].get());
++  }
++
++  SetCurrentProcessPrivileges(mPrivs);
++
++  MOZ_ASSERT(content_process_main != nullptr,
++             "content_process_main not found");
++  // Start Nuwa (main function)
++  int ret = content_process_main(argc, argv);
++
++  for (i = 0; i < argc; i++) {
++    free(argv[i]);
++  }
++  delete argv;
++
++  return ret;
++}
++
++
++class ProcLoaderChild : public PProcLoaderChild
++{
++  pid_t mPeerPid;
++
++public:
++  ProcLoaderChild(pid_t aPeerPid) : mPeerPid(aPeerPid) {}
++
++  virtual void ActorDestroy(ActorDestroyReason aWhy) MOZ_OVERRIDE;
++
++  virtual bool RecvLoad(const InfallibleTArray<nsCString>& aArgv,
++                        const InfallibleTArray<nsCString>& aEnv,
++                        const InfallibleTArray<FDRemap>& aFdsremap,
++                        const uint32_t& aPrivs,
++                        const int32_t& aCookie);
++
++  virtual void OnChannelError();
++};
++
++void
++ProcLoaderChild::ActorDestroy(ActorDestroyReason aWhy)
++{
++}
++
++static void
++_ProcLoaderChildDestroy(ProcLoaderChild *aChild)
++{
++  aChild->Close();
++  delete aChild;
++  MessageLoop::current()->Quit();
++}
++
++bool
++ProcLoaderChild::RecvLoad(const InfallibleTArray<nsCString>& aArgv,
++                          const InfallibleTArray<nsCString>& aEnv,
++                          const InfallibleTArray<FDRemap>& aFdsRemap,
++                          const uint32_t& aPrivs,
++                          const int32_t& aCookie) {
++  if (!sProcLoaderServing) {
++    return true;
++  }
++  sProcLoaderServing = false;
++
++  MOZ_ASSERT(sProcLoaderDispatchedTask == nullptr);
++  ChildPrivileges privs = static_cast<ChildPrivileges>(aPrivs);
++  sProcLoaderDispatchedTask =
++    new ProcLoaderLoadRunner(aArgv, aEnv, aFdsRemap, privs);
++
++  SendLoadComplete(mPeerPid, aCookie);
++
++  MessageLoop::current()->PostTask(FROM_HERE,
++                                   NewRunnableFunction(_ProcLoaderChildDestroy,
++                                                       this));
++  return true;
++}
++
++void
++ProcLoaderChild::OnChannelError()
++{
++  if (!sProcLoaderServing) {
++    return;
++  }
++  sProcLoaderServing = false;
++
++  PProcLoaderChild::OnChannelError();
++
++  MOZ_ASSERT(sProcLoaderDispatchedTask == nullptr);
++  sProcLoaderDispatchedTask = new ProcLoaderNoopRunner();
++
++  MessageLoop::current()->PostTask(FROM_HERE,
++                                   NewRunnableFunction(_ProcLoaderChildDestroy,
++                                                       this));
++}
++
++/**
++ * \param aPeerPid is the pid of the parent.
++ * \param aFd is the file descriptor of the socket for IPC.
++ */
++static int
++ProcLoaderServiceRun(pid_t aPeerPid, int aFd,
++                     int aArgc, const char *aArgv[])
++ {
++  char **_argv;
++  _argv = new char *[aArgc + 1];
++  for (int i = 0; i < aArgc; i++) {
++    _argv[i] = ::strdup(aArgv[i]);
++    MOZ_ASSERT(_argv[i] != nullptr);
++  }
++  _argv[aArgc] = nullptr;
++
++  gArgv = _argv;
++  gArgc = aArgc;
++
++  {
++    nsresult rv = XRE_InitCommandLine(aArgc, _argv);
++    if (NS_FAILED(rv)) {
++      return NS_ERROR_FAILURE;
++    }
++
++    FileDescriptor fd(aFd);
++    close(aFd);
++
++    MOZ_ASSERT(!sProcLoaderServing);
++    MessageLoop loop;
++
++    nsAutoPtr<ContentProcess> process;
++    process = new ContentProcess(aPeerPid);
++    ChildThread *iothread = process->child_thread();
++
++    Transport *transport = OpenDescriptor(fd, Transport::MODE_CLIENT);
++    ProcLoaderChild *loaderChild = new ProcLoaderChild(aPeerPid);
++    // Pass a message loop to initialize (connect) the channel
++    // (connection).
++    loaderChild->Open(transport, aPeerPid, iothread->message_loop());
++
++    BackgroundHangMonitor::Prohibit();
++
++    sProcLoaderServing = true;
++    loop.Run();
++
++    BackgroundHangMonitor::Allow();
++
++    XRE_DeinitCommandLine();
++  }
++
++  MOZ_ASSERT(sProcLoaderDispatchedTask != nullptr);
++  int ret = sProcLoaderDispatchedTask->DoWork();
++  delete sProcLoaderDispatchedTask;
++  sProcLoaderDispatchedTask = nullptr;
++
++  for (int i = 0; i < aArgc; i++) {
++    free(_argv[i]);
++  }
++  delete _argv;
++
++  return ret;
++}
++
++#endif /* MOZ_B2G_LOADER */
++
+ } // namespace ipc
+ } // namespace mozilla
++
++#ifdef MOZ_B2G_LOADER
++void
++XRE_ProcLoaderClientInit(pid_t aPeerPid, int aChannelFd)
++{
++  mozilla::ipc::ProcLoaderClientInit(aPeerPid, aChannelFd);
++}
++
++int
++XRE_ProcLoaderServiceRun(pid_t aPeerPid, int aFd,
++                         int aArgc, const char *aArgv[])
++{
++  return mozilla::ipc::ProcLoaderServiceRun(aPeerPid, aFd,
++                                            aArgc, aArgv);
++}
++#endif /* MOZ_B2G_LOADER */
+diff --git a/ipc/glue/moz.build b/ipc/glue/moz.build
+index 6e6e274..cdedbfa 100644
+--- a/ipc/glue/moz.build
++++ b/ipc/glue/moz.build
+@@ -94,18 +94,23 @@ UNIFIED_SOURCES += [
+ # URIUtils.cpp cannot be built in unified mode because of name clashes on strdup.
+ SOURCES += [
+     'GeckoChildProcessHost.cpp',
+     'URIUtils.cpp',
+ ]
+ 
+ IPDL_SOURCES = [
+     'InputStreamParams.ipdlh',
++    'PProcLoader.ipdl',
+     'ProtocolTypes.ipdlh',
+     'URIParams.ipdlh',
+ ]
+ 
++LOCAL_INCLUDES += [
++    '/toolkit/xre',
++]
++
+ include('/ipc/chromium/chromium-config.mozbuild')
+ 
+ FINAL_LIBRARY = 'xul'
+ 
+ for var in ('MOZ_CHILD_PROCESS_NAME', 'MOZ_CHILD_PROCESS_BUNDLE'):
+     DEFINES[var] = '"%s"' % CONFIG[var]
+diff --git a/ipc/moz.build b/ipc/moz.build
+index 471c235..f0ede71 100644
+--- a/ipc/moz.build
++++ b/ipc/moz.build
+@@ -21,9 +21,12 @@ if CONFIG['MOZ_NFC']:
+     DIRS += ['nfc']
+ 
+ if CONFIG['MOZ_B2G_RIL'] or CONFIG['MOZ_B2G_BT'] or CONFIG['MOZ_NFC'] or CONFIG['MOZ_WIDGET_TOOLKIT'] == 'gonk':
+     DIRS += ['unixsocket']
+ 
+ if CONFIG['MOZ_WIDGET_TOOLKIT'] == 'gonk':
+     DIRS += ['netd', 'keystore']
+ 
++if CONFIG['MOZ_WIDGET_TOOLKIT'] != 'android':
++    DIRS += ['contentproc']
++
+ TOOL_DIRS += ['app']
+diff --git a/toolkit/xre/nsAppRunner.cpp b/toolkit/xre/nsAppRunner.cpp
+index 90d6c51..907f135 100644
+--- a/toolkit/xre/nsAppRunner.cpp
++++ b/toolkit/xre/nsAppRunner.cpp
+@@ -196,16 +196,20 @@
+ #include "mozilla/Preferences.h"
+ #endif
+ 
+ #include "base/command_line.h"
+ #ifdef MOZ_ENABLE_TESTS
+ #include "GTestRunner.h"
+ #endif
+ 
++#ifdef MOZ_B2G_LOADER
++#include "ProcessUtils.h"
++#endif
++
+ #ifdef MOZ_WIDGET_ANDROID
+ #include "AndroidBridge.h"
+ #endif
+ 
+ extern uint32_t gRestartMode;
+ extern void InstallSignalHandlers(const char *ProgramName);
+ #include "nsX11ErrorHandler.h"
+ 
+@@ -3813,16 +3817,20 @@ XREMain::XRE_mainStartup(bool* aExitFlag)
+  * the calling of appStartup->Run().
+  */
+ nsresult
+ XREMain::XRE_mainRun()
+ {
+   nsresult rv = NS_OK;
+   NS_ASSERTION(mScopedXPCom, "Scoped xpcom not initialized.");
+ 
++#ifdef MOZ_B2G_LOADER
++  mozilla::ipc::ProcLoaderClientGeckoInit();
++#endif
++
+ #ifdef NS_FUNCTION_TIMER
+   // initialize some common services, so we don't pay the cost for these at odd times later on;
+   // SetWindowCreator -> ChromeRegistry -> IOService -> SocketTransportService -> (nspr wspm init), Prefs
+   {
+     nsCOMPtr<nsISupports> comp;
+ 
+     comp = do_GetService("@mozilla.org/preferences-service;1");
+ 
+diff --git a/xpcom/build/nsXULAppAPI.h b/xpcom/build/nsXULAppAPI.h
+index bf93e08..44edc45 100644
+--- a/xpcom/build/nsXULAppAPI.h
++++ b/xpcom/build/nsXULAppAPI.h
+@@ -461,12 +461,19 @@ enum WindowsEnvironmentType {
+ /**
+  * Retrieve the Windows desktop environment libXUL is running
+  * under. Valid after a call to XRE_main.
+  */
+ XRE_API(WindowsEnvironmentType,
+         XRE_GetWindowsEnvironment, ())
+ #endif // XP_WIN
+ 
++#ifdef MOZ_B2G_LOADER
++XRE_API(int,
++        XRE_ProcLoaderServiceRun, (pid_t, int, int argc, const char *argv[]));
++XRE_API(void,
++        XRE_ProcLoaderClientInit, (pid_t, int));
++#endif // MOZ_B2G_LOADER
++
+ XRE_API(int,
+         XRE_XPCShellMain, (int argc, char** argv, char** envp))
+ 
+ #endif // _nsXULAppAPI_h__
+diff --git a/xpcom/threads/BackgroundHangMonitor.cpp b/xpcom/threads/BackgroundHangMonitor.cpp
+index 87c8477a..15d7503 100644
+--- a/xpcom/threads/BackgroundHangMonitor.cpp
++++ b/xpcom/threads/BackgroundHangMonitor.cpp
+@@ -58,16 +58,17 @@ private:
+   bool mShutdown;
+ 
+   BackgroundHangManager(const BackgroundHangManager&);
+   BackgroundHangManager& operator=(const BackgroundHangManager&);
+   void RunMonitorThread();
+ 
+ public:
+   static StaticRefPtr<BackgroundHangManager> sInstance;
++  static bool sProhibited;
+ 
+   // Lock for access to members of this class
+   Monitor mLock;
+   // Current time as seen by hang monitors
+   PRIntervalTime mIntervalNow;
+   // List of BackgroundHangThread instances associated with each thread
+   LinkedList<BackgroundHangThread> mHangThreads;
+ 
+@@ -155,16 +156,17 @@ public:
+   {
+     NotifyActivity();
+     mWaiting = true;
+   }
+ };
+ 
+ 
+ StaticRefPtr<BackgroundHangManager> BackgroundHangManager::sInstance;
++bool BackgroundHangManager::sProhibited = false;
+ 
+ ThreadLocal<BackgroundHangThread*> BackgroundHangThread::sTlsKey;
+ 
+ 
+ BackgroundHangManager::BackgroundHangManager()
+   : mShutdown(false)
+   , mLock("BackgroundHangManager")
+   , mIntervalNow(0)
+@@ -404,16 +406,22 @@ BackgroundHangThread::NotifyActivity()
+     mInterval = intervalNow;
+   }
+ }
+ 
+ BackgroundHangThread*
+ BackgroundHangThread::FindThread()
+ {
+ #ifdef MOZ_ENABLE_BACKGROUND_HANG_MONITOR
++  if (BackgroundHangManager::sInstance == nullptr) {
++    MOZ_ASSERT(BackgroundHangManager::sProhibited,
++               "BackbroundHandleManager is not initialized");
++    return nullptr;
++  }
++
+   if (sTlsKey.initialized()) {
+     // Use TLS if available
+     return sTlsKey.get();
+   }
+   // If TLS is unavailable, we can search through the thread list
+   RefPtr<BackgroundHangManager> manager(BackgroundHangManager::sInstance);
+   MOZ_ASSERT(manager, "Creating BackgroundHangMonitor after shutdown");
+ 
+@@ -431,85 +439,125 @@ BackgroundHangThread::FindThread()
+   return nullptr;
+ }
+ 
+ 
+ void
+ BackgroundHangMonitor::Startup()
+ {
+ #ifdef MOZ_ENABLE_BACKGROUND_HANG_MONITOR
++  MOZ_ASSERT(!BackgroundHangManager::sProhibited, "Prohibited");
+   MOZ_ASSERT(!BackgroundHangManager::sInstance, "Already initialized");
+   ThreadStackHelper::Startup();
+   BackgroundHangThread::Startup();
+   BackgroundHangManager::sInstance = new BackgroundHangManager();
+ #endif
+ }
+ 
+ void
+ BackgroundHangMonitor::Shutdown()
+ {
+ #ifdef MOZ_ENABLE_BACKGROUND_HANG_MONITOR
++  MOZ_ASSERT(!BackgroundHangManager::sProhibited, "Prohibited");
+   MOZ_ASSERT(BackgroundHangManager::sInstance, "Not initialized");
+   /* Scope our lock inside Shutdown() because the sInstance object can
+      be destroyed as soon as we set sInstance to nullptr below, and
+      we don't want to hold the lock when it's being destroyed. */
+   BackgroundHangManager::sInstance->Shutdown();
+   BackgroundHangManager::sInstance = nullptr;
+   ThreadStackHelper::Shutdown();
+ #endif
+ }
+ 
+ BackgroundHangMonitor::BackgroundHangMonitor(const char* aName,
+                                              uint32_t aTimeoutMs,
+                                              uint32_t aMaxTimeoutMs)
+   : mThread(BackgroundHangThread::FindThread())
+ {
+ #ifdef MOZ_ENABLE_BACKGROUND_HANG_MONITOR
+-  if (!mThread) {
++  if (!BackgroundHangManager::sProhibited && !mThread) {
++    // If sProhibit is true, mThread would be null, and no monitoring.
+     mThread = new BackgroundHangThread(aName, aTimeoutMs, aMaxTimeoutMs);
+   }
+ #endif
+ }
+ 
+ BackgroundHangMonitor::BackgroundHangMonitor()
+   : mThread(BackgroundHangThread::FindThread())
+ {
+ #ifdef MOZ_ENABLE_BACKGROUND_HANG_MONITOR
+-  MOZ_ASSERT(mThread, "Thread not initialized for hang monitoring");
++  MOZ_ASSERT(!BackgroundHangManager::sProhibited || mThread,
++             "This thread is not initialized for hang monitoring");
+ #endif
+ }
+ 
+ BackgroundHangMonitor::~BackgroundHangMonitor()
+ {
+ }
+ 
+ void
+ BackgroundHangMonitor::NotifyActivity()
+ {
+ #ifdef MOZ_ENABLE_BACKGROUND_HANG_MONITOR
++  if (mThread == nullptr) {
++    MOZ_ASSERT(BackgroundHangManager::sProhibited,
++               "This thread is not initialized for hang monitoring");
++    return;
++  }
+   mThread->NotifyActivity();
+ #endif
+ }
+ 
+ void
+ BackgroundHangMonitor::NotifyWait()
+ {
+ #ifdef MOZ_ENABLE_BACKGROUND_HANG_MONITOR
++  if (mThread == nullptr) {
++    MOZ_ASSERT(BackgroundHangManager::sProhibited,
++               "This thread is not initialized for hang monitoring");
++    return;
++  }
+   mThread->NotifyWait();
+ #endif
+ }
+ 
++void
++BackgroundHangMonitor::Prohibit()
++{
++#ifdef MOZ_ENABLE_BACKGROUND_HANG_MONITOR
++  MOZ_ASSERT(BackgroundHangManager::sInstance == nullptr,
++             "The background hang monitor is already initialized");
++  BackgroundHangManager::sProhibited = true;
++#endif
++}
++
++void
++BackgroundHangMonitor::Allow()
++{
++#ifdef MOZ_ENABLE_BACKGROUND_HANG_MONITOR
++  MOZ_ASSERT(BackgroundHangManager::sInstance == nullptr,
++             "The background hang monitor is already initialized");
++  BackgroundHangManager::sProhibited = false;
++#endif
++}
++
+ 
+ /* Because we are iterating through the BackgroundHangThread linked list,
+    we need to take a lock. Using MonitorAutoLock as a base class makes
+    sure all of that is taken care of for us. */
+ BackgroundHangMonitor::ThreadHangStatsIterator::ThreadHangStatsIterator()
+   : MonitorAutoLock(BackgroundHangManager::sInstance->mLock)
+-  , mThread(BackgroundHangManager::sInstance->mHangThreads.getFirst())
++  , mThread(BackgroundHangManager::sInstance ?
++            BackgroundHangManager::sInstance->mHangThreads.getFirst() :
++            nullptr)
+ {
++#ifdef MOZ_ENABLE_BACKGROUND_HANG_MONITOR
++  MOZ_ASSERT(BackgroundHangManager::sInstance || BackgroundHangManager::sProhibited,
++             "Inconsistent state");
++#endif
+ }
+ 
+ Telemetry::ThreadHangStats*
+ BackgroundHangMonitor::ThreadHangStatsIterator::GetNext()
+ {
+   if (!mThread) {
+     return nullptr;
+   }
+diff --git a/xpcom/threads/BackgroundHangMonitor.h b/xpcom/threads/BackgroundHangMonitor.h
+index 776ead1..b4fdd4a 100644
+--- a/xpcom/threads/BackgroundHangMonitor.h
++++ b/xpcom/threads/BackgroundHangMonitor.h
+@@ -99,16 +99,18 @@ class BackgroundHangThread;
+  *        hangMonitor.NotifyWait();
+  *        wait_for_next_event();
+  *      }
+  *    } else {
+  *      process_nonsync_event();
+  *    }
+  *  }
+  *
++ * Prohibit() and Allow() allow the background hang monitor working
++ * safely before Startup().
+  */
+ class BackgroundHangMonitor
+ {
+ private:
+   RefPtr<BackgroundHangThread> mThread;
+ 
+ public:
+   static const uint32_t kNoTimeout = 0;
+@@ -196,13 +198,34 @@ public:
+   void NotifyActivity();
+ 
+   /**
+    * Notify the hang monitor of current thread wait.
+    * Call this method before entering a wait state; call
+    * NotifyActivity when subsequently exiting the wait state.
+    */
+   void NotifyWait();
++
++  /**
++   * Prohibit the hang monitor from active.
++   *
++   * Startup() should not be called in the duration from Prohibit() to
++   * Allow().  This function make the background hang monitor stopping
++   * monitoring threads.
++   *
++   * Prohibit() and Allow() could be called before XPCOM is ready.
++   * Without stop monitoring, it would go error if XPCOM is not ready.
++   */
++  static void Prohibit();
++
++  /**
++   * Allow the hang monitor to be ran.
++   *
++   * Allow() and Prohibit() should be called in pair.
++   *
++   * \see Prohibit()
++   */
++  static void Allow();
+ };
+ 
+ } // namespace mozilla
+ 
+ #endif // mozilla_BackgroundHangMonitor_h

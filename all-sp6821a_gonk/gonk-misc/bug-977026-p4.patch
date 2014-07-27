@@ -1,0 +1,45 @@
+diff --git a/b2g-info/process.cpp b/b2g-info/process.cpp
+index 3dd84d6..78cad62 100644
+--- a/b2g-info/process.cpp
++++ b/b2g-info/process.cpp
+@@ -113,7 +113,7 @@ Task::ensure_got_stat()
+     "[0-9]+ "     // cutime (%ld)
+     "[0-9]+ "     // cstime (%ld)
+     "[0-9]+ "     // priority (%ld)
+-    "([0-9]+)";   // niceness
++    "(-?[0-9]+)";   // niceness
+ 
+   if (m_got_stat) {
+     return;
+diff --git a/b2g-info/processlist.cpp b/b2g-info/processlist.cpp
+index 9fdaed7..40f2357 100644
+--- a/b2g-info/processlist.cpp
++++ b/b2g-info/processlist.cpp
+@@ -76,7 +76,7 @@ ProcessList::main_process()
+   const vector<Process*>& processes = all_processes();
+   for (vector<Process*>::const_iterator it = processes.begin();
+        it != processes.end(); ++it) {
+-    if ((*it)->exe() == "/system/b2g/b2g") {
++    if ((*it)->exe() == "/system/b2g/b2g" && (*it)->name() == "b2g") {
+       if (m_main_process == NULL) {
+         m_main_process = *it;
+       } else {
+@@ -108,12 +108,13 @@ ProcessList::child_processes()
+   // We could find child processes by looking for processes whose ppid matches
+   // the main process's pid, but this requires reading /proc/<pid>/stat for
+   // every process on the system.  It's a bit faster just to look for processes
+-  // whose |exe|s are "/system/b2g/plugin-container".  As an added bonus, this
+-  // will work properly with nested content processes.
++  // whose |exe|s are "/system/b2g/b2g".  As an added bonus, this will work
++  // properly with nested content processes.
+ 
+-  for (vector<Process*>::const_iterator it = all_processes().begin();
+-       it != all_processes().end(); ++it) {
+-    if ((*it)->exe() == "/system/b2g/plugin-container") {
++  const vector<Process*>& processes = all_processes();
++  for (vector<Process*>::const_iterator it = processes.begin();
++       it != processes.end(); ++it) {
++    if ((*it)->exe() == "/system/b2g/b2g" && (*it)->name() != "b2g") {
+       m_child_processes.push_back(*it);
+     }
+   }
