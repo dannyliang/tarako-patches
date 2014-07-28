@@ -1,0 +1,190 @@
+From fa6aa3cc1af16449c2a1585df2a47853e081022f Mon Sep 17 00:00:00 2001
+From: tingyuan <thuang@mozilla.com>
+Date: Mon, 28 Apr 2014 15:21:36 +0800
+Subject: [PATCH] Bug 1002346 - Show swap usage in b2g-info
+
+---
+ b2g-info/b2g-info.cpp |   48 +++++++++++++++++++++++++++++++++++-------------
+ b2g-info/process.cpp  |   12 +++++++++++-
+ b2g-info/process.h    |    4 ++++
+ 3 files changed, 50 insertions(+), 14 deletions(-)
+
+diff --git a/b2g-info/b2g-info.cpp b/b2g-info/b2g-info.cpp
+index cce4991..cf9c08b 100644
+--- a/b2g-info/b2g-info.cpp
++++ b/b2g-info/b2g-info.cpp
+@@ -119,27 +119,39 @@ void print_system_meminfo()
+   int free = -1;
+   int buffers = -1;
+   int cached = -1;
++  int swap_total = -1;
++  int swap_free = -1;
++  int swap_cached = -1;
+ 
+   char line[256];
+   while(fgets(line, sizeof(line), meminfo)) {
+-    if (sscanf(line, "MemTotal: %d kB", &total) == 0 &&
+-        sscanf(line, "MemFree: %d kB", &free) == 0 &&
+-        sscanf(line, "Buffers: %d kB", &buffers) == 0 &&
+-        sscanf(line, "Cached: %d kB", &cached)) {
+-      // These four values should appear first in meminfo, so if this line
+-      // doesn't match any of them, we're done parsing.
+-      break;
++    int val;
++    if (sscanf(line, "MemTotal: %d kB", &val) == 1) {
++        total = val;
++    } else if (sscanf(line, "MemFree: %d kB", &val) == 1) {
++        free = val;
++    } else if (sscanf(line, "Buffers: %d kB", &val) == 1) {
++        buffers = val;
++    } else if (sscanf(line, "Cached: %d kB", &val) == 1) {
++        cached = val;
++    } else if (sscanf(line, "SwapTotal: %d kB", &val) == 1) {
++        swap_total = val;
++    } else if (sscanf(line, "SwapFree: %d kB", &val) == 1) {
++        swap_free = val;
++    } else if (sscanf(line, "SwapCached: %d kB", &val) == 1) {
++        swap_cached = val;
+     }
+   }
+ 
+   fclose(meminfo);
+ 
+-  if (total == -1 || free == -1 || buffers == -1 || cached == -1) {
++  if (total == -1 || free == -1 || buffers == -1 || cached == -1 ||
++      swap_total == -1 || swap_free == -1 || swap_cached == -1) {
+     fprintf(stderr, "Unable to parse /proc/meminfo.\n");
+     return;
+   }
+ 
+-  int actually_used = total - free - buffers - cached;
++  int actually_used = total - free - buffers - cached - swap_cached;
+ 
+   puts("System memory info:\n");
+ 
+@@ -150,8 +162,12 @@ void print_system_meminfo()
+   t.add_fmt("%0.1f MB", kb_to_mb(total));
+ 
+   t.start_row();
++  t.add("SwapTotal");
++  t.add_fmt("%0.1f MB", kb_to_mb(swap_total));
++
++  t.start_row();
+   t.add("Used - cache");
+-  t.add_fmt("%0.1f MB", kb_to_mb(total - free - buffers - cached));
++  t.add_fmt("%0.1f MB", kb_to_mb(total - free - buffers - cached - swap_cached));
+ 
+   t.start_row();
+   t.add("B2G procs (PSS)");
+@@ -165,11 +181,11 @@ void print_system_meminfo()
+ 
+   t.start_row();
+   t.add("Non-B2G procs");
+-  t.add_fmt("%0.1f MB", kb_to_mb(total - free - buffers - cached - b2g_mem_kb));
++  t.add_fmt("%0.1f MB", kb_to_mb(total - free - buffers - cached - b2g_mem_kb - swap_cached));
+ 
+   t.start_row();
+   t.add("Free + cache");
+-  t.add_fmt("%0.1f MB", kb_to_mb(free + buffers + cached));
++  t.add_fmt("%0.1f MB", kb_to_mb(free + buffers + cached + swap_cached));
+ 
+   t.start_row();
+   t.add("Free");
+@@ -177,7 +193,11 @@ void print_system_meminfo()
+ 
+   t.start_row();
+   t.add("Cache");
+-  t.add_fmt("%0.1f MB", kb_to_mb(buffers + cached));
++  t.add_fmt("%0.1f MB", kb_to_mb(buffers + cached + swap_cached));
++
++  t.start_row();
++  t.add("SwapFree");
++  t.add_fmt("%0.1f MB", kb_to_mb(swap_free));
+ 
+   t.print_with_indent(2);
+ }
+@@ -247,6 +267,7 @@ b2g_ps_add_table_headers(Table& t, bool show_threads)
+   t.add("USS");
+   t.add("PSS");
+   t.add("RSS");
++  t.add("SWAP");
+   t.add("VSIZE");
+   t.add("OOM_ADJ");
+   t.add("USER", Table::ALIGN_LEFT);
+@@ -285,6 +306,7 @@ print_b2g_info(bool show_threads)
+     t.add_fmt("%0.1f", p->uss_mb());
+     t.add_fmt("%0.1f", p->pss_mb());
+     t.add_fmt("%0.1f", p->rss_mb());
++    t.add_fmt("%0.1f", p->swap_mb());
+     t.add_fmt("%0.1f", p->vsize_mb());
+     t.add(p->oom_adj());
+     t.add(p->user(), Table::ALIGN_LEFT);
+diff --git a/b2g-info/process.cpp b/b2g-info/process.cpp
+index 3dd84d6..5ba354f 100644
+--- a/b2g-info/process.cpp
++++ b/b2g-info/process.cpp
+@@ -205,6 +205,7 @@ Process::Process(pid_t pid)
+   , m_rss_kb(-1)
+   , m_pss_kb(-1)
+   , m_uss_kb(-1)
++  , m_swap_kb(-1)
+ {}
+ 
+ pid_t
+@@ -336,7 +337,7 @@ Process::ensure_got_meminfo()
+     return;
+   }
+ 
+-  m_vsize_kb = m_rss_kb = m_pss_kb = m_uss_kb = 0;
++  m_vsize_kb = m_rss_kb = m_pss_kb = m_uss_kb = m_swap_kb = 0;
+ 
+   char line[256];
+   while(fgets(line, sizeof(line), f)) {
+@@ -350,6 +351,8 @@ Process::ensure_got_meminfo()
+       } else if (sscanf(line, "Private_Dirty: %d kB", &val) == 1 ||
+                  sscanf(line, "Private_Clean: %d kB", &val) == 1) {
+         m_uss_kb += val;
++      } else if (sscanf(line, "Swap: %d kB", &val) == 1) {
++        m_swap_kb += val;
+       }
+   }
+ 
+@@ -384,6 +387,13 @@ Process::uss_kb()
+   return m_uss_kb;
+ }
+ 
++int
++Process::swap_kb()
++{
++  ensure_got_meminfo();
++  return m_swap_kb;
++}
++
+ const string&
+ Process::user()
+ {
+diff --git a/b2g-info/process.h b/b2g-info/process.h
+index cff1ae2..13d5a91 100644
+--- a/b2g-info/process.h
++++ b/b2g-info/process.h
+@@ -120,6 +120,9 @@ public:
+   int uss_kb();
+   double uss_mb() { return kb_to_mb(uss_kb()); }
+ 
++  int swap_kb();
++  double swap_mb() { return kb_to_mb(swap_kb()); }
++
+   const std::string& user();
+ 
+ private:
+@@ -140,6 +143,7 @@ private:
+   int m_rss_kb;
+   int m_pss_kb;
+   int m_uss_kb;
++  int m_swap_kb;
+ 
+   std::string m_user;
+ };
+-- 
+1.7.9.5
+
